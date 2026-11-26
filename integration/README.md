@@ -1,4 +1,6 @@
-# 检出棱镜的五插件工作区
+# 复现编排器的集成版本
+
+首次安装请使用 [dsh-prism 主仓库](https://github.com/dsh-plugins/dsh-prism)。这里的集成快照用于复现本次编排器提交与四个配套插件的行为。
 
 编排器的每个集成版本都保存了 npm 工作区的根配置、依赖锁和跨插件测试。`peers.lock` 记录与当前编排器搭配的四个插件提交。需要有权读取这五个 GitHub 仓库的 Git 凭据，以及 Node.js 24.9 或更高版本。
 
@@ -17,4 +19,4 @@ npm ci
 npm test
 ```
 
-需要复现历史版本时，在导出工作区配置前，将 `dsh-orchestrator` 检出到对应的提交。模型、项目、Mesh 节点和 Telegram 的配置方式见工作区说明。[部署与启动](workspace/README.md)
+需要复现历史版本时，在导出工作区配置前，将 `dsh-orchestrator` 检出到对应的提交。当前配置和 IM 接入方式请参阅[使用手册](https://github.com/dsh-plugins/dsh-prism/blob/main/README.zh_CN.md)及[技术文档](https://github.com/dsh-plugins/dsh-prism/blob/main/docs/TECH.md)。

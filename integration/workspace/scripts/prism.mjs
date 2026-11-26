@@ -18,6 +18,8 @@ export function makePatch(config, directory = root) {
   if (registry.catalogFile) registry.catalogFile = resolve(directory, registry.catalogFile)
   const orchestrator = { ...config.orchestrator }
   if (orchestrator.stateDirectory) orchestrator.stateDirectory = resolve(directory, orchestrator.stateDirectory)
+  const im = { ...config.im }
+  if (im.statePath && im.statePath !== ':memory:') im.statePath = resolve(directory, im.statePath)
   const nativeTools = [
     { id: 'prism-fs', name: '@deepseek-ai/dsh-tool-fs', config: { applyPatch: true } },
     { id: 'prism-search', name: '@deepseek-ai/dsh-tool-fs-search', config: { sampleOverCapGlobResults: false } },
@@ -29,7 +31,7 @@ export function makePatch(config, directory = root) {
       config: { id: 'prism-' + id, name: 'Prism ' + id.toUpperCase(), plugins: id === 'l3' ? nativeTools : [] },
     })),
     plugin('dsh-workspace-registry', registry), plugin('dsh-mesh-node', mesh),
-    plugin('dsh-orchestrator', orchestrator), plugin('dsh-im-gateway', config.im ?? {}),
+    plugin('dsh-orchestrator', orchestrator), plugin('dsh-im-gateway', im),
     plugin('dsh-concierge-ui', {}),
   ] }]
 }

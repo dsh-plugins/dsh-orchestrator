@@ -1,0 +1,19 @@
+{
+  "meta": {
+    "title": "棱镜任务编排",
+    "description": "管理交互、规划和执行会话，约束工具权限并派发任务。",
+    "detail": "README.zh_CN.md"
+  },
+  "messages": {
+    "modelNotFound": "该层未配置所选模型",
+    "defaultProject": "需要配置默认项目",
+    "modelRequired": "{layer} 至少需要一个模型",
+    "modelDetails": "{layer} 模型需要唯一 ID 和模型介绍",
+    "promptMode": "未知的模型提示词模式",
+    "promptText": "模型提示词必须是文本",
+    "provider": "模型提供方无效",
+    "replacePrompt": "替换系统提示词时需要提供模型提示词",
+    "unsupportedTools": "执行权限中包含不支持的工具",
+    "ceiling": "请求的工具超出权限上限"
+  }
+}

@@ -1,52 +1,43 @@
-# 棱镜 · 分层调度
+<div align="center">
 
-`@dsh-prism/dsh-orchestrator` 为 DeepSeek Harness 建立 L1 交互、L2 规划和 L3 执行会话。Web 与 IM 插件通过 Cordis 服务 `ctx.prism` 提交用户消息、切换 L1 模型、获取公开状态和读取任务轨迹。
+<img src="icon.svg" width="256" height="256" alt="dsh-orchestrator icon">
 
-## 模型和项目
+# dsh-orchestrator
 
-在插件配置中设置 `defaultProjectId`，并在项目注册表中向相应用户授权这个项目。三层分别配置至少一个模型。同一层的 `id` 唯一，`description` 为必填的能力介绍。可选的 `provider` 指向节点上已注册的 DSH 模型提供方。下例展示调度字段，模型 ID 需与实际配置相符。
+**Give Prism separate models for talking to users, planning their requests and executing each step.**
 
-```yaml
-defaultProjectId: reception
-defaultL1Model: chat-fast
-executionTools: [read, glob, grep, edit]
-models:
-  L1:
-    - id: chat-fast
-      description: 中文对话与项目分流
-      prompt: 先确认用户需要的结果，再决定是否派发。
-  L2:
-    - id: project-planner
-      description: 多步骤规划、并行拆解与结果验收
-      prompt: 先列出可交付结果，再派发执行步骤。
-      promptMode: append
-  L3:
-    - id: code-worker
-      description: TypeScript 代码阅读与编辑
-      prompt: 在已授权的项目中完成分派的编码步骤，通过 send_parent 汇报结果。
-      promptMode: replace
+English | [简体中文](README.zh_CN.md)
+
+</div>
+
+## Set up Prism
+
+Use Node.js 24.9 or later, npm, Git and credentials with read access to the five private plugin repositories. The checkout script places matching plugins and launcher files in a local `runtime/` directory. Run subsequent installation, configuration and launch commands there. The public guide is available without signing in. To use the example models, configure your DeepSeek credentials in DSH or set the `DEEPSEEK_API_KEY` environment variable. [Installation guide](https://prism.dsh-plug.in/)
+
+```sh
+git clone https://github.com/dsh-plugins/dsh-prism.git
+cd dsh-prism
+node scripts/checkout.mjs
+cd runtime
+npm ci
+npm run build
+npm start
 ```
 
-`append` 是默认模式，DSH 装配系统提示词时会保留原有提示词，并附加本层指令和模型提示词。`replace` 使用配置文本作为完整系统提示词，DSH 工具授权仍由运行时执行。上级调用 `list_models` 获取下一层模型的 ID 和介绍，派发时提交所选模型的 ID。用户切换 L1 模型后，新入队的消息使用新模型，已入队的消息保留接收时的模型。
+## Set up the model roster
 
-## 派发和主动发信
+In `runtime/`, copy the Prism example to `prism.config.json`. Under `orchestrator.models`, list the models available to each layer. Give every model an `id` recognized by its DSH provider and a `description` that explains when to choose it. For example, a quick search model and a cross-file analysis model give the planner two distinct choices.
 
-| 层级 | 代理可用的调度工具 | 约束 |
+| Layer | Who chooses the model | What it can do |
 | --- | --- | --- |
-| L1 | `query_projects`、`list_models`、`dispatch_planner`、`send_child`、`get_progress`、`send_user` | 绑定默认项目。项目查询返回登记的元数据。只有调用 `send_user` 才会向该用户追加助手消息。 |
-| L2 | `list_models`、`dispatch_executor`、`send_child`、`get_progress`、`send_parent`、`report_progress` | 使用 L1 指定的已授权项目。通过 `dispatch_executor` 拆分步骤，每次选择一个 L3 模型。 |
-| L3 | `send_parent`、`report_progress`，以及授权的原生工具 | 服务端从 L2 继承工作区和节点。原生工具集合取节点配置、项目策略和逐级派发授权的交集。 |
+| L1 · conversation | The user, in Web or IM | Query project metadata, contact planners, check progress and send visible replies. |
+| L2 · planning | L1, when assigning a project | Break a task into steps, choose execution models and report to L1. |
+| L3 · execution | L2, for each step | Use the granted tools in the planner’s project and return results. |
 
-两种派发工具都接收 `title`、`instruction`、`modelId` 和可选的 `permissions`。L1 派发还必须提供 `projectId`。返回的 `taskId` 可用于向自己的直接子任务发信、查询其进展和下属步骤。每次派发可以收窄后续任务权限。`executionTools` 可配置的原生 DSH 工具为 `read`、`read_image`、`glob`、`grep`、`write`、`edit`、`apply_patch`、`bash`，实际可用项还取决于宿主挂载的工具。启用 `bash` 会授予该执行节点配置的 shell 能力。
+Set `orchestrator.defaultProjectId` and optionally `defaultL1Model`. Use `prompt` on individual models to supply role guidance. The default `append` mode adds it to the system prompt. Set `promptMode` to `replace` to provide the full system prompt. After restarting, open the model selector and check that the description and L1 choices match your configuration.
 
-`send_parent` 和 `send_child` 将带来源的消息交付目标代理，即使对方已空闲也会触发新的会话轮次。`report_progress` 更新供上级查询的进展。子任务自己的消息轮次与下属任务都结束后，系统向其直接上级投递 `task_settled` 事件。L1 可据此向用户发信。公开任务卡只包含任务标题、层级关系、状态和更新时间；打开轨迹时按通道认证得到的用户和任务 ID 校验归属，然后只读查询 DSH 会话日志。
+```sh
+npm start -- prism.config.json --host 127.0.0.1 --port 3080 --no-open
+```
 
-## 持久化与恢复
-
-`conversations.sqlite` 以 SQLite 事务同时保存用户消息、任务状态、模型选择与待投递事件。Web 或 IM 携带同一用户范围内的 `requestId` 重试时会得到已有的对话快照。每个逻辑代理串行处理消息，独立任务可以并发执行。服务重启后继续处理已提交且尚未开始的轮次。若旧进程在执行工具期间退出，恢复时会将该轮次记录为失败并通知任务上级，以避免重复执行可能已经生效的操作。L1 用户消息会得到相应的投递状态。
-
-DSH 自身保存正式会话事件。节点侧 `sessions.sqlite` 保存逻辑会话到 DSH 会话的绑定。激活遇到实际所有权锁冲突时，从原会话日志生成 Fork 并以事务重新绑定，原会话进入归档。归档义务持久化，可在下次激活时重试。只读轨迹入口不会激活代理。
-
-## 安装完整工作区
-
-五个插件以独立仓库开发。编排器仓库保存整套应用所需的工作区配置、依赖锁、配套插件提交号与端到端测试。[检出与验证](integration/README.md)
+[Prism documentation](https://prism.dsh-plug.in/) · [Technical reference](docs/TECH.md)

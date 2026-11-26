@@ -1,3 +1,4 @@
+import { messages } from './messages.js'
 import {randomUUID} from 'node:crypto'
 import type {AgentTools, ConversationView, Layer, ModelConfig, OrchestratorConfig, ProjectMetadata, RegistryPort, SessionRunner, TraceEntry, TurnSpec} from './contracts.js'
 import {modelFor, nativeExecutionTools, systemPrompt, toolSets, validateConfig} from './policy.js'
@@ -17,7 +18,7 @@ function textField(value: unknown, max = 32_000): string {
 function narrow(ceiling: string[], requested: unknown): string[] {
   if (requested === undefined) return [...ceiling]
   if (!Array.isArray(requested) || requested.some(value => typeof value !== 'string' || !ceiling.includes(value))) {
-    throw new PrismError('INVALID_INPUT', '请求的工具超出权限上限')
+    throw new PrismError('INVALID_INPUT', messages.ceiling)
   }
   return [...new Set<string>(requested)]
 }

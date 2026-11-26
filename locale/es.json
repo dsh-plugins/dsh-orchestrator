@@ -1,0 +1,18 @@
+{
+  "meta": {
+    "title": "Orquestación de Prism",
+    "description": "Gestiona sesiones de interacción, planificación y ejecución, aplica permisos y distribuye tareas."
+  },
+  "messages": {
+    "modelNotFound": "El modelo elegido no está configurado para esta capa",
+    "defaultProject": "Configura un proyecto predeterminado",
+    "modelRequired": "{layer} requiere al menos un modelo",
+    "modelDetails": "Cada modelo de {layer} necesita un ID único y una descripción",
+    "promptMode": "Modo de instrucciones del modelo desconocido",
+    "promptText": "Las instrucciones del modelo deben ser texto",
+    "provider": "Proveedor de modelos no válido",
+    "replacePrompt": "Proporciona instrucciones en el modo de sustitución",
+    "unsupportedTools": "Los permisos de ejecución incluyen herramientas no compatibles",
+    "ceiling": "Las herramientas solicitadas superan los permisos concedidos"
+  }
+}

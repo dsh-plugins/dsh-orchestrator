@@ -1,0 +1,18 @@
+{
+  "meta": {
+    "title": "Prism-Aufgabensteuerung",
+    "description": "Verwaltet Dialog-, Planungs- und Ausführungssitzungen, begrenzt Werkzeugrechte und verteilt Aufgaben."
+  },
+  "messages": {
+    "modelNotFound": "Das ausgewählte Modell ist für diese Ebene nicht konfiguriert",
+    "defaultProject": "Ein Standardprojekt ist erforderlich",
+    "modelRequired": "{layer} benötigt mindestens ein Modell",
+    "modelDetails": "Jedes Modell in {layer} benötigt eine eindeutige ID und eine Beschreibung",
+    "promptMode": "Unbekannter Prompt-Modus für das Modell",
+    "promptText": "Der Modellprompt muss Text sein",
+    "provider": "Ungültiger Modellanbieter",
+    "replacePrompt": "Im Ersetzungsmodus ist ein Modellprompt erforderlich",
+    "unsupportedTools": "Ausführungsrechte enthalten nicht unterstützte Werkzeuge",
+    "ceiling": "Angeforderte Werkzeuge überschreiten die Berechtigungsgrenze"
+  }
+}

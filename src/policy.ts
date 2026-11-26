@@ -1,3 +1,4 @@
+import { messages } from './messages.js'
 import type {Layer, ModelConfig, OrchestratorConfig, ToolDefinition} from './contracts.js'
 
 const layerPrompts: Record<Layer, string> = {
@@ -10,7 +11,7 @@ export const nativeExecutionTools = ['read', 'read_image', 'glob', 'grep', 'writ
 
 export function modelFor(config: OrchestratorConfig, layer: Layer, id: string): ModelConfig {
   const entry = config.models[layer]?.find(model => model.id === id)
-  if (!entry) throw new Error('该层未配置所选模型')
+  if (!entry) throw new Error(messages.modelNotFound)
   return entry
 }
 
@@ -20,25 +21,25 @@ export function systemPrompt(layer: Layer, model: ModelConfig): string {
 }
 
 export function validateConfig(config: OrchestratorConfig): void {
-  if (!config.defaultProjectId?.trim()) throw new Error('需要配置默认项目')
+  if (!config.defaultProjectId?.trim()) throw new Error(messages.defaultProject)
   for (const layer of ['L1', 'L2', 'L3'] as const) {
     const models = config.models?.[layer]
-    if (!Array.isArray(models) || !models.length) throw new Error(`${layer} 至少需要一个模型`)
+    if (!Array.isArray(models) || !models.length) throw new Error(messages.modelRequired.replace('{layer}', () => layer))
     const seen = new Set<string>()
     for (const model of models) {
       if (typeof model?.id !== 'string' || !model.id.trim() || typeof model.description !== 'string' || !model.description.trim() || seen.has(model.id)) {
-        throw new Error(`${layer} 模型需要唯一 ID 和模型介绍`)
+        throw new Error(messages.modelDetails.replace('{layer}', () => layer))
       }
-      if (model.promptMode && !['append', 'replace'].includes(model.promptMode)) throw new Error('未知的模型提示词模式')
-      if (model.prompt !== undefined && typeof model.prompt !== 'string') throw new Error('模型提示词必须是文本')
-      if (model.provider !== undefined && (typeof model.provider !== 'string' || !model.provider.trim())) throw new Error('模型提供方无效')
-      if (model.promptMode === 'replace' && !model.prompt?.trim()) throw new Error('替换系统提示词时需要提供模型提示词')
+      if (model.promptMode && !['append', 'replace'].includes(model.promptMode)) throw new Error(messages.promptMode)
+      if (model.prompt !== undefined && typeof model.prompt !== 'string') throw new Error(messages.promptText)
+      if (model.provider !== undefined && (typeof model.provider !== 'string' || !model.provider.trim())) throw new Error(messages.provider)
+      if (model.promptMode === 'replace' && !model.prompt?.trim()) throw new Error(messages.replacePrompt)
       seen.add(model.id)
     }
   }
   if (config.defaultL1Model !== undefined) modelFor(config, 'L1', config.defaultL1Model)
   if (config.executionTools !== undefined && (!Array.isArray(config.executionTools) || config.executionTools.some(tool => !nativeExecutionTools.includes(tool)))) {
-    throw new Error('执行权限中包含不支持的工具')
+    throw new Error(messages.unsupportedTools)
   }
 }
 

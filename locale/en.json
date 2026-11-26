@@ -1,0 +1,19 @@
+{
+  "meta": {
+    "title": "Prism orchestration",
+    "description": "Manage interaction, planning and execution sessions, enforce tool permissions and dispatch tasks.",
+    "detail": "README.md"
+  },
+  "messages": {
+    "modelNotFound": "The selected model is not configured for this layer",
+    "defaultProject": "Configure a default project",
+    "modelRequired": "{layer} requires at least one model",
+    "modelDetails": "Each {layer} model needs a unique ID and a description",
+    "promptMode": "Unknown model prompt mode",
+    "promptText": "The model prompt must be text",
+    "provider": "Invalid model provider",
+    "replacePrompt": "Provide a model prompt in replacement mode",
+    "unsupportedTools": "Execution permissions contain unsupported tools",
+    "ceiling": "Requested tools exceed the permission ceiling"
+  }
+}

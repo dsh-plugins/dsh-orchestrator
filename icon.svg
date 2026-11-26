@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Orchestrator</title>
+  <desc id="desc">A planning node directs one task to three execution nodes.</desc>
+  <defs><linearGradient id="ground" x2="1" y2="1" gradientUnits="objectBoundingBox"><stop stop-color="#214F42"/><stop offset="1" stop-color="#102E2B"/></linearGradient></defs>
+  <rect x="3" y="3" width="122" height="122" rx="27" fill="url(#ground)"/>
+  <g stroke-linejoin="round" stroke-linecap="round">
+  <path fill="none" stroke="#81BCA7" stroke-width="5" d="M64 48v15H30v14m34-14v17m0-17h34v14"/>
+  <path fill="#C2EDD2" d="m64 19 18 29H46z"/><path fill="#70CAAB" d="m64 19-2 20-16 9z"/>
+  <rect x="20" y="77" width="20" height="20" rx="5" fill="#92E0BE"/><rect x="54" y="77" width="20" height="20" rx="5" fill="#F6C581"/><rect x="88" y="77" width="20" height="20" rx="5" fill="#B8A9F0"/>
+  </g>
+</svg>

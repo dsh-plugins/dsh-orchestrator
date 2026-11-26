@@ -25,7 +25,8 @@ test('real DSH Web sends a task through three scoped agents and only publishes e
     const page = await host.client('/')
     assert.equal(page.status, 200)
     const html = await page.text()
-    assert.match(html, /棱镜/)
+    assert.match(html, /<title>Prism · Chat<\/title>/)
+    assert.equal(page.headers.get('content-language'), 'en')
     const nonce = /id="prism-browser" nonce="([^"]+)"/.exec(html)?.[1]
     assert.ok(nonce && page.headers.get('content-security-policy')?.includes(`'nonce-${nonce}'`))
     const [script, css] = await Promise.all([host.client('/prism/browser.js'), host.client('/prism/style.css')])

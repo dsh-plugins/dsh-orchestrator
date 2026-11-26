@@ -1,0 +1,18 @@
+{
+  "meta": {
+    "title": "Orquestração do Prism",
+    "description": "Gerencia sessões de diálogo, planejamento e execução, aplica permissões e distribui tarefas."
+  },
+  "messages": {
+    "modelNotFound": "O modelo selecionado não está configurado para esta camada",
+    "defaultProject": "Configure um projeto padrão",
+    "modelRequired": "{layer} precisa de pelo menos um modelo",
+    "modelDetails": "Cada modelo de {layer} precisa de um ID único e uma descrição",
+    "promptMode": "Modo de instruções do modelo desconhecido",
+    "promptText": "As instruções do modelo devem ser texto",
+    "provider": "Provedor de modelos inválido",
+    "replacePrompt": "Forneça instruções no modo de substituição",
+    "unsupportedTools": "As permissões de execução incluem ferramentas incompatíveis",
+    "ceiling": "As ferramentas solicitadas excedem as permissões concedidas"
+  }
+}
