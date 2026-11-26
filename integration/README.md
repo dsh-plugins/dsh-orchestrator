@@ -6,7 +6,7 @@
 
 ```sh
 mkdir dsh-prism && cd dsh-prism
-git clone --branch work https://github.com/dsh-plugins/dsh-orchestrator.git
+git clone --branch main https://github.com/dsh-plugins/dsh-orchestrator.git
 git -C dsh-orchestrator archive HEAD:integration/workspace | tar -xf -
 while read -r revision plugin; do
   git clone --no-checkout "https://github.com/dsh-plugins/${plugin}.git" "$plugin" &&
