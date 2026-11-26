@@ -10,8 +10,9 @@ import { SessionAlreadyOwnedError } from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-session-query'
 import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native'
 import type {} from '@deepseek-ai/dsh-workspace'
-import type { AgentTools, SessionRunner, TraceEntry, TurnSpec } from './contracts.js'
+import type { AgentTools, RegistryPort, SessionRunner, TraceEntry, TurnSpec } from './contracts.js'
 import { SessionBindings } from './host-bindings.js'
+import { resolveBinding } from './policy.js'
 
 function trace(events: readonly SessionEvent[]): TraceEntry[] {
   const entries: TraceEntry[] = []
@@ -34,7 +35,7 @@ export class DshSessionRunner implements SessionRunner {
   private readonly shutdown = new AbortController()
   private closing?: Promise<void>
 
-  constructor(private readonly ctx: Context, stateDirectory: string) {
+  constructor(private readonly ctx: Context, stateDirectory: string, private readonly registry?: RegistryPort) {
     this.bindings = new SessionBindings(stateDirectory)
   }
 
@@ -78,6 +79,14 @@ export class DshSessionRunner implements SessionRunner {
         scope.tools.guard(exec => {
           if (!allowed.has(exec.name)) return 'Tool exceeds this session’s permission ceiling'
           if (this.bindings.current(spec) !== agent.session.id) return 'Session binding has moved'
+          if (this.registry) {
+            try {
+              const project = resolveBinding(this.registry, spec.owner, spec.workspace)
+              if (native.includes(exec.name) && !project.permissions.includes(exec.name)) return 'Project tool permission was revoked'
+            } catch {
+              return 'Project access was revoked or the workspace moved'
+            }
+          }
         })
         if (spec.layer !== 'L3') {
           // DSH marks its global cwd reminder required. Shadow that specific registration

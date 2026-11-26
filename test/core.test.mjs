@@ -46,6 +46,9 @@ test('three persistent actors enforce grant ceilings, exchange addressed message
           await assert.rejects(call('dispatch_planner', {...task, modelId:'worker'}))
           await assert.rejects(call('dispatch_planner', {...task, permissions:['bash']}))
           l2 = (await call('dispatch_planner', task)).taskId
+          const progress = await call('get_progress', {taskId:l2})
+          assert.deepEqual(progress, JSON.parse(JSON.stringify(progress)))
+          assert.equal(Object.hasOwn(progress, 'result'), false)
           await call('send_child', {taskId:l2, text:'使用只读检查'})
           await call('send_user', {text:'已安排核对。'})
           expired = tools
@@ -64,13 +67,18 @@ test('three persistent actors enforce grant ceilings, exchange addressed message
             await call('report_progress',{text:'核对中'})
             await call('send_parent',{text:'正在核对'})
           }
-          if (event.kind === 'task_settled') assert.equal(event.taskId,l3)
+          if (event.kind === 'task_settled') {
+            assert.equal(event.taskId, l3)
+            assert.equal(event.result, '内部结果')
+            assert.equal((await call('get_progress', {taskId: l3})).result, event.result)
+          }
         }
         if (spec.layer === 'L3') {
           assert.equal(spec.workspace.cwd,'/private/invoice')
           assert.deepEqual(spec.allowedTools,['read'])
           await assert.rejects(call('dispatch_executor',{}))
-          await call('send_parent',{text:'内部结果'})
+          await call('send_parent',{text:'读取中'})
+          await call('send_parent',{text:'内部结果', final:true})
         }
         if (spec.layer === 'L1' && event.kind === 'child_message') {
           assert.ok((await call('get_progress',{taskId:l2})).children.length >= 1)
@@ -112,7 +120,9 @@ test('three persistent actors enforce grant ceilings, exchange addressed message
     assert.throws(()=>core.authorizeRemote({...spec,owner:'bob'}))
     assert.throws(()=>core.authorizeRemote({...spec,allowedTools:['bash']}))
     assert.ok(turns.some(turn=>turn.spec.layer==='L2' && turn.event.kind==='parent_message'))
-    assert.ok(turns.some(turn=>turn.spec.layer==='L2' && turn.event.kind==='child_message'))
+    const notifications = turns.filter(turn => turn.spec.layer === 'L2' && turn.event.taskId === l3).map(turn => turn.event)
+    assert.deepEqual(notifications.map(event => event.kind), ['child_message', 'task_settled'])
+    assert.deepEqual(notifications.map(event => event.text ?? event.result), ['读取中', '内部结果'])
     assert.equal(new Set(turns.filter(t=>t.spec.layer==='L1').map(t=>t.spec.bindingId)).size,1)
   } finally { await core.close() }
 
@@ -196,13 +206,20 @@ test('a killed scheduler releases ownership; the next host marks in-flight work 
     await core.message('alice','first')
     await ready
     await core.message('alice','second')
-    setInterval(()=>{},60000)
-    process.stdout.write('claimed')
+    // The production plugin retains its scheduler as a Cordis service. Expose
+    // a live IPC reader so garbage collection cannot dispose this host's lease.
+    process.on('message', async () => {
+      const view = await core.view('alice')
+      process.send(view.messages.map(message => message.delivery))
+    })
+    await new Promise(setImmediate)
+    globalThis.gc()
+    process.send('claimed')
   `
-  const worker = spawn(process.execPath,['--input-type=module','-e',script,dir], {stdio:['ignore','pipe','inherit']})
+  const worker = spawn(process.execPath,['--expose-gc','--input-type=module','-e',script,dir], {stdio:['ignore','ignore','inherit','ipc']})
   t.after(()=>worker.kill('SIGKILL'))
   const closed = once(worker,'close')
-  const ready = await Promise.race([once(worker.stdout,'data').then(([chunk])=>String(chunk)),closed.then(()=>{throw new Error('scheduler exited before claim')})])
+  const ready = await Promise.race([once(worker,'message').then(([message])=>message),closed.then(()=>{throw new Error('scheduler exited before claim')})])
   assert.equal(ready,'claimed')
   const seen = []
   const core = new Orchestrator(config,registry,{async run(_spec,text){seen.push(JSON.parse(text).text)},async transcript(){return []}},dir)
@@ -210,6 +227,9 @@ test('a killed scheduler releases ownership; the next host marks in-flight work 
     await core.start()
     await core.whenIdle()
     assert.deepEqual(seen,[])
+    const liveSnapshot = once(worker, 'message')
+    worker.send('snapshot')
+    assert.deepEqual((await liveSnapshot)[0], ['pending','pending'])
     worker.kill('SIGKILL')
     await closed
     await core.start()
@@ -217,4 +237,133 @@ test('a killed scheduler releases ownership; the next host marks in-flight work 
     assert.deepEqual(seen,['second'])
     assert.deepEqual((await core.view('alice')).messages.map(m=>m.delivery),['failed','processed'])
   } finally { await core.close() }
+})
+
+test('host defaults follow the native model picker and the initial project stays authorized', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'prism-host-default-'))
+  t.after(() => rm(dir, {recursive:true, force:true}))
+  let available = []
+  const liveRegistry = {
+    query: () => available,
+    resolve(_owner, id) {
+      const project = available.find(p => p.id === id)
+      if (!project) throw new Error('Project access revoked')
+      return project
+    },
+  }
+  let route = {id: 'initial', provider: 'first', description: 'First route'}
+  const firstTurn = Promise.withResolvers()
+  const continueFirstTurn = Promise.withResolvers()
+  const seen = []
+  const runner = {
+    async run(spec, raw, tools) {
+      const event = JSON.parse(raw)
+      seen.push([spec.workspace.projectId, spec.model.provider, spec.model.id])
+      if (event.text === 'first') {
+        firstTurn.resolve()
+        await continueFirstTurn.promise
+      }
+      if (event.text === 'revoke-active') {
+        available = []
+        await assert.rejects(tools.invoke('query_projects', {}), /revoked/)
+      }
+    },
+    async transcript() { return [] },
+  }
+  const open = () => new Orchestrator({useHostModel:true}, liveRegistry, runner, dir, () => ({...route}))
+  const core = open()
+  try {
+    await core.start()
+    await assert.rejects(core.view('alice'), /No authorized/)
+    available = [projects.invoice, projects.lobby]
+    assert.equal((await core.view('alice')).modelId, 'initial')
+    await core.message('alice', 'first')
+    await firstTurn.promise
+    route = {id:'flash', provider:'custom', description:'Custom route'}
+    await core.message('alice', 'second')
+    route = {...route, provider:'another-route'}
+    assert.deepEqual((await core.view('alice')).models, [{id:'flash', description:'Custom route'}])
+    continueFirstTurn.resolve()
+    await core.whenIdle()
+    assert.deepEqual(seen, [['invoice','first','initial'],['invoice','custom','flash']])
+  } finally { continueFirstTurn.resolve(); await core.close() }
+
+  const resumed = open()
+  try {
+    available = [projects.lobby, projects.invoice]
+    await resumed.start()
+    await resumed.message('alice', 'revoke-active')
+    await resumed.whenIdle()
+    assert.deepEqual(seen.at(-1), ['invoice','another-route','flash'])
+    await assert.rejects(resumed.message('alice', 'after-revoke', 'retry-after-grant'))
+    assert.equal((await resumed.view('alice')).messages.length, 3)
+    assert.equal(seen.length, 3)
+    available = [projects.lobby]
+    await resumed.message('alice', 'after-revoke', 'retry-after-grant')
+    await resumed.message('alice', 'after-revoke', 'retry-after-grant')
+    await resumed.whenIdle()
+    assert.deepEqual(seen.at(-1), ['lobby','another-route','flash'])
+    assert.equal(seen.length, 4)
+    const {messages} = await resumed.view('alice')
+    assert.deepEqual(messages.map(m => m.text), ['first','second','revoke-active','after-revoke'])
+    assert.equal(messages.at(-1).delivery, 'processed')
+  } finally { await resumed.close() }
+})
+
+test('moving a project creates a new root without redirecting queued work or losing conversation history', {timeout:10000}, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'prism-root-move-'))
+  t.after(() => rm(dir, {recursive:true, force:true}))
+  let project = projects.lobby
+  const liveRegistry = {
+    query: () => [project],
+    resolve(_owner, id) {
+      if (id !== project.id) throw new Error('Project access revoked')
+      return project
+    },
+  }
+  const entered = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  const turns = []
+  const runner = {
+    async run(spec, raw, tools) {
+      const {text} = JSON.parse(raw)
+      turns.push({text, binding:spec.bindingId, cwd:spec.workspace.cwd, node:spec.workspace.nodeId})
+      if (text === 'in flight') {
+        entered.resolve()
+        await release.promise
+        await tools.invoke('send_user', {text:'Stale result from the former directory'})
+      }
+      if (text === 'earlier') await tools.invoke('send_user', {text:'Earlier reply'})
+    },
+    async transcript() { return [] },
+  }
+  const hostModel = () => ({id:'flash', provider:'responses', description:'Responses'})
+  const core = new Orchestrator({useHostModel:true}, liveRegistry, runner, dir, hostModel)
+  try {
+    await core.start()
+    await core.message('alice', 'earlier', 'first')
+    await core.whenIdle()
+    await core.message('alice', 'in flight', 'active')
+    await entered.promise
+    await core.message('alice', 'queued in the former directory', 'queued')
+
+    project = {...project, workspace:'/moved/lobby', nodeId:'other-node'}
+    await core.message('alice', 'work in the new directory', 'recovery')
+    await core.message('alice', 'work in the new directory', 'recovery')
+    release.resolve()
+    await core.whenIdle()
+
+    assert.deepEqual(turns.map(turn => turn.text), ['earlier','in flight','work in the new directory'])
+    assert.equal(turns[1].binding, turns[0].binding)
+    assert.notEqual(turns[2].binding, turns[0].binding)
+    assert.deepEqual([turns[0].cwd,turns[0].node], [projects.lobby.workspace,projects.lobby.nodeId])
+    assert.deepEqual([turns[2].cwd,turns[2].node], [project.workspace,project.nodeId])
+    const {messages} = await core.view('alice')
+    assert.deepEqual(messages.map(m => m.text), [
+      'earlier','Earlier reply','in flight','queued in the former directory','work in the new directory',
+    ])
+    assert.equal(messages[2].delivery, 'failed')
+    assert.equal(messages[3].delivery, 'failed')
+    assert.equal(messages[4].delivery, 'processed')
+  } finally { release.resolve(); await core.close() }
 })

@@ -8,11 +8,19 @@ export interface ModelConfig {
   promptMode?: 'append' | 'replace'
 }
 
-export interface OrchestratorConfig {
-  defaultProjectId: string
+interface ProjectPolicy {
+  defaultProjectId?: string
+  executionTools?: string[]
+}
+
+export interface HostModelConfig extends ProjectPolicy {
+  useHostModel: true
+}
+
+export interface OrchestratorConfig extends ProjectPolicy {
+  useHostModel?: false
   defaultL1Model?: string
   models: Record<Layer, ModelConfig[]>
-  executionTools?: string[]
 }
 
 export interface ProjectMetadata {

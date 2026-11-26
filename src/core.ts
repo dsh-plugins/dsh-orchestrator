@@ -1,13 +1,13 @@
 import { messages } from './messages.js'
 import {randomUUID} from 'node:crypto'
-import type {AgentTools, ConversationView, Layer, ModelConfig, OrchestratorConfig, ProjectMetadata, RegistryPort, SessionRunner, TraceEntry, TurnSpec} from './contracts.js'
-import {modelFor, nativeExecutionTools, systemPrompt, toolSets, validateConfig} from './policy.js'
+import type {AgentTools, ConversationView, HostModelConfig, Layer, ModelConfig, OrchestratorConfig, ProjectMetadata, RegistryPort, SessionRunner, TraceEntry, TurnSpec} from './contracts.js'
+import {modelFor, nativeExecutionTools, resolveBinding, systemPrompt, toolSets, validateConfig} from './policy.js'
 import {ConversationStore, enqueue, type Binding, type Conversation, type Job, type Task} from './store.js'
 
 export type * from './contracts.js'
 
 export class PrismError extends Error {
-  constructor(readonly code: 'INVALID_INPUT' | 'NOT_FOUND', message: string) { super(message) }
+  constructor(readonly code: 'INVALID_INPUT' | 'NOT_FOUND' | 'NO_PROJECT', message: string) { super(message) }
 }
 
 function textField(value: unknown, max = 32_000): string {
@@ -25,9 +25,9 @@ function narrow(ceiling: string[], requested: unknown): string[] {
 
 function binding(state: Conversation, id: string): Binding {
   if (state.root.id === id) return state.root
-  const task = state.tasks.find(task => task.id === id)
-  if (!task) throw new PrismError('NOT_FOUND', '找不到会话')
-  return task
+  const actor = state.tasks.find(task => task.id === id) ?? state.previousRoots?.find(root => root.id === id)
+  if (!actor) throw new PrismError('NOT_FOUND', '找不到会话')
+  return actor
 }
 
 function publicCatalog(models: ModelConfig[]): {id: string; description: string}[] {
@@ -39,15 +39,30 @@ function terminal(task: Task): boolean { return task.status === 'completed' || t
 
 export class Orchestrator {
   private readonly store: ConversationStore
-  private readonly config: OrchestratorConfig
+  private readonly config: OrchestratorConfig | HostModelConfig
+  private readonly readHostModel?: () => ModelConfig
   private readonly active = new Map<string, Promise<void>>()
   private readonly watchers = new Map<string, Set<(view: ConversationView) => void>>()
   private stopping = false
 
-  constructor(config: OrchestratorConfig, private readonly registry: RegistryPort, private readonly runner: SessionRunner, stateDirectory: string) {
-    validateConfig(config)
+  constructor(config: OrchestratorConfig | HostModelConfig, private readonly registry: RegistryPort,
+    private readonly runner: SessionRunner, stateDirectory: string, hostModel?: () => ModelConfig) {
     this.config = structuredClone(config)
+    if (config.useHostModel) {
+      if (!hostModel) throw new Error('DSH default model selection is unavailable')
+      this.readHostModel = hostModel
+    }
+    validateConfig(this.currentConfig())
     this.store = new ConversationStore(stateDirectory)
+  }
+
+  private currentConfig(): OrchestratorConfig {
+    if (!this.config.useHostModel) return this.config
+    const model = this.readHostModel!()
+    return {
+      defaultProjectId: this.config.defaultProjectId, executionTools: this.config.executionTools,
+      models: {L1: [model], L2: [model], L3: [model]},
+    }
   }
 
   async start(): Promise<void> {
@@ -57,7 +72,7 @@ export class Orchestrator {
         for (const job of [...state.queue]) {
           if (job.worker && !this.store.workerAlive(job.worker)) this.settle(state, job, false)
         }
-        if (!this.config.models.L1.some(model => model.id === state.root.modelId)) {
+        if (!this.currentConfig().models.L1.some(model => model.id === state.root.modelId)) {
           state.root.modelId = this.defaultModel()
         }
       })
@@ -65,14 +80,39 @@ export class Orchestrator {
     }
   }
 
-  private defaultModel(): string { return this.config.defaultL1Model ?? this.config.models.L1[0].id }
+  private defaultModel(): string {
+    const config = this.currentConfig()
+    return config.defaultL1Model ?? config.models.L1[0].id
+  }
+
+  private newRoot(owner: string, projectId?: string): Binding {
+    if (projectId === undefined) throw new PrismError('NO_PROJECT', 'No authorized Prism project is available')
+    const project = this.registry.resolve(owner, projectId)
+    return {
+      id: randomUUID(), layer: 'L1', modelId: this.defaultModel(), ceiling: [],
+      target: {projectId: project.id, nodeId: project.nodeId, cwd: project.workspace},
+    }
+  }
 
   private newConversation(owner: string): Conversation {
-    const project = this.registry.resolve(owner, this.config.defaultProjectId)
-    return {
-      root: {id: randomUUID(), layer: 'L1', modelId: this.defaultModel(), ceiling: [], target: {projectId: project.id, nodeId: project.nodeId, cwd: project.workspace}},
-      messages: [], tasks: [], requests: [], queue: [],
+    const projectId = this.config.defaultProjectId ?? this.registry.query(owner)[0]?.id
+    return {root: this.newRoot(owner, projectId), messages: [], tasks: [], requests: [], queue: []}
+  }
+
+  private refreshRoot(owner: string, state: Conversation): void {
+    if (this.config.defaultProjectId !== undefined) return
+    const available = this.registry.query(owner)
+    const target = state.root.target
+    if (available.some(project => project.id === target.projectId)) {
+      const project = this.registry.resolve(owner, target.projectId)
+      if (project.nodeId === target.nodeId && project.workspace === target.cwd) return
     }
+    const next = this.newRoot(owner, available[0]?.id)
+    // Existing jobs, agent sessions and child notifications retain the original
+    // binding ID and its authorization checks, even across a host restart.
+    const previous = state.previousRoots ??= []
+    previous.push(state.root)
+    state.root = next
   }
 
   private change<T>(owner: string, fn: (state: Conversation) => T): T {
@@ -81,9 +121,10 @@ export class Orchestrator {
   }
 
   private snapshot(state: Conversation): ConversationView {
+    const models = this.currentConfig().models.L1
     return {
-      modelId: state.root.modelId,
-      models: publicCatalog(this.config.models.L1),
+      modelId: this.config.useHostModel ? models[0].id : state.root.modelId,
+      models: publicCatalog(models),
       messages: state.messages,
       tasks: state.tasks.map(task => ({
         id: task.id, title: task.layer === 'L3' ? '执行步骤' : task.title,
@@ -104,9 +145,14 @@ export class Orchestrator {
     if (requestId !== undefined) textField(requestId, 1024)
     const result = this.change(owner, state => {
       if (requestId && state.requests.includes(requestId)) return this.snapshot(state)
+      this.refreshRoot(owner, state)
       if (requestId) state.requests.push(requestId)
       const messageId = randomUUID()
       state.messages.push({id: messageId, role: 'user', delivery: 'pending', text, at: now()})
+      if (this.readHostModel) {
+        state.root.hostModel = this.readHostModel()
+        state.root.modelId = state.root.hostModel.id
+      }
       enqueue(state, state.root, JSON.stringify({kind: 'user', text}), messageId)
       return this.snapshot(state)
     })
@@ -116,7 +162,7 @@ export class Orchestrator {
   }
 
   async selectModel(owner: string, modelId: string): Promise<ConversationView> {
-    if (!this.config.models.L1.some(model => model.id === modelId)) throw new PrismError('INVALID_INPUT', '此交互模型不可用')
+    if (!this.currentConfig().models.L1.some(model => model.id === modelId)) throw new PrismError('INVALID_INPUT', '此交互模型不可用')
     const view = this.change(owner, state => { state.root.modelId = modelId; return this.snapshot(state) })
     this.publish(owner)
     return view
@@ -158,11 +204,11 @@ export class Orchestrator {
     textField(spec.bindingId, 256)
     if (!['L1', 'L2', 'L3'].includes(spec.layer)) throw new Error('未知代理层级')
     if (spec.layer === 'L1') {
-      if (spec.parentBindingId !== undefined || spec.workspace.projectId !== this.config.defaultProjectId) throw new Error('交互会话必须绑定默认项目')
+      if (spec.parentBindingId !== undefined || (this.config.defaultProjectId !== undefined && spec.workspace.projectId !== this.config.defaultProjectId)) throw new Error('交互会话必须绑定默认项目')
     } else { textField(spec.parentBindingId, 256) }
     const project = this.registry.resolve(spec.owner, spec.workspace.projectId)
     if (project.nodeId !== spec.workspace.nodeId) throw new Error('项目节点不匹配')
-    const model = modelFor(this.config, spec.layer, spec.model.id)
+    const model = modelFor(this.currentConfig(), spec.layer, spec.model.id)
     if (!Array.isArray(spec.allowedTools)) throw new Error('缺少权限声明')
     const allowedTools = narrow(spec.layer === 'L3' ? this.ceiling(project) : [], spec.allowedTools)
     return {
@@ -173,11 +219,10 @@ export class Orchestrator {
     }
   }
 
-  private spec(owner: string, actor: Binding, modelId: string, parentBindingId?: string): TurnSpec {
-    if (actor.layer === 'L1' && actor.target.projectId !== this.config.defaultProjectId) throw new Error('默认项目绑定已变更')
-    const project = this.registry.resolve(owner, actor.target.projectId)
-    if (project.nodeId !== actor.target.nodeId || project.workspace !== actor.target.cwd) throw new Error('会话绑定的工作区已变更')
-    const model = modelFor(this.config, actor.layer, modelId)
+  private spec(owner: string, actor: Binding, modelId: string, parentBindingId?: string, hostModel = actor.hostModel): TurnSpec {
+    if (actor.layer === 'L1' && this.config.defaultProjectId !== undefined && actor.target.projectId !== this.config.defaultProjectId) throw new Error('默认项目绑定已变更')
+    const project = resolveBinding(this.registry, owner, actor.target)
+    const model = this.readHostModel ? hostModel ?? this.readHostModel() : modelFor(this.currentConfig(), actor.layer, modelId)
     const currentCeiling = this.ceiling(project).filter(tool => actor.ceiling.includes(tool))
     return {
       owner, bindingId: actor.id, parentBindingId, layer: actor.layer, model: {...model}, workspace: {...actor.target},
@@ -207,14 +252,14 @@ export class Orchestrator {
       job.worker = this.store.workerId
       const task = state.tasks.find(task => task.id === id)
       if (task) { task.status = 'running'; task.at = now() }
-      return {job, actor: task ?? state.root, parent: task?.parent}
+      return {job, actor: binding(state, id), parent: task?.parent}
     })
     if (!claimed) return
     this.publish(owner)
     const {actor, job, parent} = claimed
     let succeeded = false
     try {
-      const spec = this.spec(owner, actor, job.modelId, parent)
+      const spec = this.spec(owner, actor, job.modelId, parent, job.hostModel)
       const tools: AgentTools = {
         definitions: structuredClone(toolSets[actor.layer]),
         invoke: async (name, args) => {
@@ -249,11 +294,15 @@ export class Orchestrator {
     task.status = !task.turnFailed && children.every(child => child.status === 'completed') ? 'completed' : 'failed'
     task.at = now()
     const parent = binding(state, task.parent)
-    enqueue(state, parent, JSON.stringify({kind: 'task_settled', taskId: task.id, status: task.status, progress: task.progress}))
+    enqueue(state, parent, JSON.stringify({
+      kind: 'task_settled', taskId: task.id, title: task.title, projectId: task.target.projectId,
+      status: task.status, progress: task.progress, result: task.finalReport,
+    }))
   }
 
   private invoke(owner: string, state: Conversation, id: string, name: string, raw: unknown): unknown {
     const actor = binding(state, id)
+    resolveBinding(this.registry, owner, actor.target)
     const definition = toolSets[actor.layer].find(tool => tool.name === name)
     if (!definition || !raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('该层无权调用此工具，或参数格式无效')
     const args = raw as Record<string, unknown>
@@ -273,7 +322,7 @@ export class Orchestrator {
           id, description, stack, nodeId, permissions, ...(gitRemote === undefined ? {} : {gitRemote}),
         }))
       }
-      case 'list_models': return publicCatalog(this.config.models[actor.layer === 'L1' ? 'L2' : 'L3'])
+      case 'list_models': return publicCatalog(this.currentConfig().models[actor.layer === 'L1' ? 'L2' : 'L3'])
       case 'dispatch_planner':
       case 'dispatch_executor': return this.dispatch(owner, state, actor, args)
       case 'report_progress': {
@@ -284,7 +333,16 @@ export class Orchestrator {
       }
       case 'send_parent': {
         const task = state.tasks.find(task => task.id === id)!
-        enqueue(state, binding(state, task.parent), JSON.stringify({kind: 'child_message', taskId: task.id, text: textField(args.text)}))
+        const text = textField(args.text)
+        if (args.final !== undefined && typeof args.final !== 'boolean') throw new PrismError('INVALID_INPUT', 'final 必须为布尔值')
+        if (args.final) {
+          if (state.tasks.some(child => child.parent === id && !terminal(child))) {
+            throw new PrismError('INVALID_INPUT', '等待仍在运行的子任务完成后提交最终结果')
+          }
+          task.finalReport = text
+          return {recorded: true, delivery: 'task_settled'}
+        }
+        enqueue(state, binding(state, task.parent), JSON.stringify({kind: 'child_message', taskId: task.id, text}))
         return {sent: true}
       }
       case 'get_progress':
@@ -293,9 +351,13 @@ export class Orchestrator {
         if (!child) throw new PrismError('NOT_FOUND', '找不到直接子任务')
         if (name === 'get_progress') {
           const children = state.tasks.filter(task => task.parent === child.id).map(({id, title, status, progress}) => ({id, title, status, progress}))
-          return {id: child.id, status: child.status, progress: child.progress, children}
+          return {
+            id: child.id, status: child.status, progress: child.progress, children,
+            ...(child.finalReport === undefined ? {} : {result: child.finalReport}),
+          }
         }
         if (terminal(child)) { child.status = 'queued'; child.turnFailed = false; child.at = now() }
+        delete child.finalReport
         enqueue(state, child, JSON.stringify({kind: 'parent_message', text: textField(args.text)}))
         return {sent: true}
       }
@@ -305,7 +367,7 @@ export class Orchestrator {
 
   private dispatch(owner: string, state: Conversation, actor: Binding, args: Record<string, unknown>): {taskId: string} {
     const layer = actor.layer === 'L1' ? 'L2' : 'L3'
-    const model = modelFor(this.config, layer, textField(args.modelId, 256))
+    const model = modelFor(this.currentConfig(), layer, textField(args.modelId, 256))
     const projectId = layer === 'L2' ? textField(args.projectId, 1024) : actor.target.projectId
     const project = this.registry.resolve(owner, projectId)
     const target = layer === 'L2' ? {projectId, nodeId: project.nodeId, cwd: project.workspace} : {...actor.target}
@@ -313,6 +375,7 @@ export class Orchestrator {
     const ceiling = this.ceiling(project).filter(name => layer === 'L2' || actor.ceiling.includes(name))
     const task: Task = {
       id: randomUUID(), layer, target, modelId: model.id, ceiling: narrow(ceiling, args.permissions),
+      ...(this.config.useHostModel && {hostModel: model}),
       parent: actor.id, title: textField(args.title, 240), progress: '', at: now(), status: 'queued',
     }
     state.tasks.push(task)

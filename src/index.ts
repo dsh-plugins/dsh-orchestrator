@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { dshPath } from '@deepseek-ai/dsh-home-paths'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type {} from '@dsh-prism/dsh-workspace-registry'
-import type { Layer, OrchestratorConfig, SessionRunner, ToolDefinition, TurnSpec } from './contracts.js'
+import type { HostModelConfig, Layer, OrchestratorConfig, SessionRunner, ToolDefinition, TurnSpec } from './contracts.js'
 import { Orchestrator } from './core.js'
 import { DshSessionRunner } from './host.js'
 import { PrismProvider, ProviderRouter } from './provider.js'
@@ -17,7 +17,7 @@ export const name = 'dsh-orchestrator'
 export const inject = ['prismRegistry', 'dshMesh', 'subagents', 'agents', 'agentPresets',
   'agentDefaultModel', 'tools', 'systemPrompt', 'sessions', 'sessionQuery', 'sessionPersistence', 'workspaceRegistry']
 
-export interface Config extends OrchestratorConfig { stateDirectory?: string }
+export type Config = (OrchestratorConfig | HostModelConfig) & { stateDirectory?: string }
 
 interface MeshService {
   nodeId: string
@@ -36,13 +36,16 @@ declare module '@deepseek-ai/cordis' {
 export async function apply(ctx: Context, config: Config) {
   const mesh = ctx.get('dshMesh', true) as MeshService
   const directory = config.stateDirectory ?? dshPath('data', 'prism')
-  const local = new DshSessionRunner(ctx, directory)
+  const local = new DshSessionRunner(ctx, directory, ctx.prismRegistry)
   for (const id of [mesh.nodeId, ...mesh.nodeIds]) {
     const provider = new PrismProvider(id, id === mesh.nodeId ? local : mesh.runnerFor(id))
     ctx.subagents.registerProvider(provider)
   }
   const router = new ProviderRouter(ctx.subagents)
-  const core = new Orchestrator(config, ctx.prismRegistry, router, directory)
+  const core = new Orchestrator(config, ctx.prismRegistry, router, directory, () => {
+    const { provider, model } = ctx.agentDefaultModel.currentSelection()
+    return { id: model, provider, description: provider }
+  })
   const detach = mesh.attach({ runner: local, authorize: spec => core.authorizeRemote(spec), definitionsFor: layer => toolSets[layer] })
   const close = async () => {
     router.close()

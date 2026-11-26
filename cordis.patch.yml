@@ -1,0 +1,33 @@
+- insert:
+    - id: prism-preset-l1
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: prism-l1
+        name: Prism L1
+        plugins: []
+    - id: prism-preset-l2
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: prism-l2
+        name: Prism L2
+        plugins: []
+    - id: prism-preset-l3
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: prism-l3
+        name: Prism L3
+        plugins:
+          - id: prism-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: true
+          - id: prism-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: prism-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+    - id: dsh-orchestrator
+      name: '@dsh-prism/dsh-orchestrator'
+      config:
+        useHostModel: true

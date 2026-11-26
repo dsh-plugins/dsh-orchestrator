@@ -2,12 +2,13 @@ import {randomUUID} from 'node:crypto'
 import {chmodSync, existsSync, mkdirSync, rmSync} from 'node:fs'
 import {join} from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
-import type {Layer, PublicMessage, TaskCard, WorkspaceTarget} from './contracts.js'
+import type {Layer, ModelConfig, PublicMessage, TaskCard, WorkspaceTarget} from './contracts.js'
 
 export interface Binding {
   id: string
   layer: Layer
   modelId: string
+  hostModel?: ModelConfig
   target: WorkspaceTarget
   ceiling: string[]
 }
@@ -18,6 +19,7 @@ export interface Task extends Binding {
   status: TaskCard['status']
   at: string
   progress: string
+  finalReport?: string
   turnFailed?: boolean
 }
 
@@ -25,6 +27,7 @@ export interface Job {
   id: string
   bindingId: string
   modelId: string
+  hostModel?: ModelConfig
   text: string
   worker?: string | number
   messageId?: string
@@ -32,6 +35,7 @@ export interface Job {
 
 export interface Conversation {
   root: Binding
+  previousRoots?: Binding[]
   tasks: Task[]
   messages: PublicMessage[]
   requests: string[]
@@ -39,7 +43,7 @@ export interface Conversation {
 }
 
 export function enqueue(state: Conversation, target: Binding, text: string, messageId?: string): void {
-  state.queue.push({id: randomUUID(), bindingId: target.id, modelId: target.modelId, text, messageId})
+  state.queue.push({id: randomUUID(), bindingId: target.id, modelId: target.modelId, hostModel: target.hostModel, text, messageId})
 }
 
 export class ConversationStore {
