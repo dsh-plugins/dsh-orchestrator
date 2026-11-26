@@ -1,0 +1,35 @@
+{
+  "registry": {
+    "projects": [
+      {
+        "id": "prism",
+        "description": "棱镜插件工程，包含 Web、IM、模型调度和跨机执行。",
+        "stack": ["TypeScript", "DSH", "SQLite"],
+        "nodeId": "local",
+        "workspace": ".",
+        "principals": "*",
+        "permissions": ["read", "glob", "grep"]
+      }
+    ]
+  },
+  "orchestrator": {
+    "defaultProjectId": "prism",
+    "defaultL1Model": "deepseek-flash",
+    "models": {
+      "L1": [
+        {"id":"deepseek-flash","provider":"deepseek-official","description":"快速理解简短请求，适合日常联络。","promptMode":"append","prompt":"用用户的语言交流，回复尽量简短。"},
+        {"id":"deepseek-v4-pro","provider":"deepseek-official","description":"擅长复杂需求澄清与多目标协调。","promptMode":"append","prompt":"若目标存在实质歧义，先通过 send_user 澄清。"}
+      ],
+      "L2": [
+        {"id":"deepseek-v4-pro","provider":"deepseek-official","description":"适合复杂依赖分析、并行拆解和验收。","promptMode":"append","prompt":"可独立验证的步骤可并行派发。"},
+        {"id":"deepseek-flash","provider":"deepseek-official","description":"适合目标明确的轻量规划。","promptMode":"append","prompt":"优先设计最短的可验证执行路径。"}
+      ],
+      "L3": [
+        {"id":"deepseek-flash","provider":"deepseek-official","description":"适合快速检索、小范围核对。","promptMode":"append","prompt":"用可复核的证据向规划代理汇报。"},
+        {"id":"deepseek-v4-pro","provider":"deepseek-official","description":"适合复杂实现和跨文件分析。","promptMode":"replace","prompt":"你是执行代理。在继承的工作区和已授权工具范围内完成此步骤，用 report_progress 记录进展，用 send_parent 向规划代理发送结果和验证依据。"}
+      ]
+    }
+  },
+  "mesh": {"nodeId":"local","peers":[],"incoming":[]},
+  "im": {}
+}
