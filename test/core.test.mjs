@@ -367,3 +367,144 @@ test('moving a project creates a new root without redirecting queued work or los
     assert.equal(messages[4].delivery, 'processed')
   } finally { release.resolve(); await core.close() }
 })
+
+test('delegated requests finish independently and a silent root gets one delivery-only turn', {timeout:10000}, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'prism-finalize-'))
+  t.after(() => rm(dir, {recursive:true, force:true}))
+  const slowPlannerStarted = Promise.withResolvers()
+  const releaseSlowPlanner = Promise.withResolvers()
+  const otherReplySent = Promise.withResolvers()
+  const finalized = []
+  const observedErrors = []
+  const assignment = text => ({projectId:'lobby', modelId:'flash', title:text, instruction:text})
+  const runner = {
+    async run(spec, raw, tools) {
+      const event = JSON.parse(raw)
+      try {
+        if (spec.layer === 'L1' && event.kind === 'user') {
+          await tools.invoke('dispatch_planner', assignment(event.text))
+        } else if (spec.layer === 'L2' && event.kind === 'assignment') {
+          if (event.text === 'first request') {
+            slowPlannerStarted.resolve()
+            await releaseSlowPlanner.promise
+          }
+          await tools.invoke('send_parent', {text:event.text + ' result', final:true})
+        } else if (event.kind === 'task_settled' && event.result === 'second request result') {
+          await tools.invoke('send_user', {text:'Second answer'})
+          otherReplySent.resolve()
+        } else if (event.kind === 'finalize_response') {
+          finalized.push(event)
+          assert.equal(spec.layer, 'L1')
+          assert.deepEqual(tools.definitions.map(tool => tool.name), ['send_user'])
+          await assert.rejects(tools.invoke('dispatch_planner', assignment('extra task')))
+          await tools.invoke('send_user', {text:'First answer'})
+        }
+      } catch (error) { observedErrors.push(error); throw error }
+    },
+    async transcript() { return [] },
+  }
+  const core = new Orchestrator({useHostModel:true}, registry, runner, dir, () => model('flash'))
+  try {
+    await core.start()
+    await core.message('alice', 'first request', 'slow-id')
+    await slowPlannerStarted.promise
+    await core.message('alice', 'second request', 'fast-id')
+    await otherReplySent.promise
+    assert.equal(finalized.length, 0)
+    await core.message('alice', 'first request', 'slow-id')
+    releaseSlowPlanner.resolve()
+    await core.whenIdle()
+    await core.message('alice', 'first request', 'slow-id')
+    await core.whenIdle()
+    assert.deepEqual(observedErrors, [])
+    assert.equal(finalized.length, 1)
+    assert.equal(finalized[0].userRequest, 'first request')
+    assert.deepEqual(finalized[0].tasks.map(task => task.result), ['first request result'])
+    const view = await core.view('alice')
+    assert.equal(view.tasks.length, 2)
+    assert.ok(view.tasks.every(task => task.status === 'completed'))
+    assert.deepEqual(view.messages.map(m => m.text), ['first request','second request','Second answer','First answer'])
+    assert.deepEqual(view.messages.filter(m => m.role === 'user').map(m => m.delivery), ['processed','processed'])
+  } finally { releaseSlowPlanner.resolve(); await core.close() }
+})
+
+test('an unanswered delivery-only turn fails the originating message once, including after replay or restart', {timeout:10000}, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'prism-finalize-failure-'))
+  t.after(() => rm(dir, {recursive:true, force:true}))
+  const events = []
+  const runner = {
+    async run(_spec, raw, tools) {
+      const event = JSON.parse(raw)
+      events.push(event.kind)
+      if (event.kind === 'user') {
+        await tools.invoke('dispatch_planner', {projectId:'lobby', modelId:'flash', title:'check', instruction:'check'})
+      }
+      if (event.kind === 'assignment') await tools.invoke('send_parent', {text:'Internal evidence', final:true})
+      // Stop a broken retry loop so the assertions can report the duplicate turn.
+      if (event.kind === 'finalize_response' && events.filter(kind => kind === 'finalize_response').length > 1) {
+        await tools.invoke('send_user', {text:'Unexpected duplicate delivery turn'})
+      }
+    },
+    async transcript() { return [] },
+  }
+  const open = () => new Orchestrator({useHostModel:true}, registry, runner, dir, () => model('flash'))
+  let core = open()
+  try {
+    await core.start()
+    await core.message('alice', 'check', 'check-id')
+    await core.whenIdle()
+    assert.equal(events.filter(kind => kind === 'finalize_response').length, 1)
+    const before = await core.view('alice')
+    assert.deepEqual(before.messages.map(m => [m.role,m.text,m.delivery]), [['user','check','failed']])
+    assert.equal(before.tasks[0].status, 'completed')
+    const turnCount = events.length
+    await core.close()
+    core = open()
+    await core.start()
+    await core.message('alice', 'check', 'check-id')
+    await core.whenIdle()
+    assert.equal(events.length, turnCount)
+    assert.deepEqual((await core.view('alice')).messages, before.messages)
+  } finally { await core.close() }
+})
+
+test('progress messages before dispatch and between planner results do not satisfy final delivery', {timeout:10000}, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'prism-progress-delivery-'))
+  t.after(() => rm(dir, {recursive:true, force:true}))
+  const releaseSecond = Promise.withResolvers()
+  const deliveryTurns = []
+  const runner = {
+    async run(_spec, raw, tools) {
+      const event = JSON.parse(raw)
+      if (event.kind === 'user') {
+        await tools.invoke('send_user', {text:'Checking the projects.'})
+        for (const projectId of ['lobby','invoice']) {
+          await tools.invoke('dispatch_planner', {projectId, modelId:'flash', title:projectId, instruction:projectId})
+        }
+      } else if (event.kind === 'assignment') {
+        if (event.projectId === 'invoice') await releaseSecond.promise
+        await tools.invoke('send_parent', {text:event.projectId + ' evidence', final:true})
+      } else if (event.kind === 'task_settled' && event.projectId === 'lobby') {
+        await tools.invoke('send_user', {text:'One of the two projects has reported.'})
+        releaseSecond.resolve()
+      } else if (event.kind === 'finalize_response') {
+        deliveryTurns.push(event)
+        await tools.invoke('send_user', {text:'Both results are ready.'})
+      }
+    },
+    async transcript() { return [] },
+  }
+  const core = new Orchestrator({useHostModel:true}, registry, runner, dir, () => model('flash'))
+  try {
+    await core.start()
+    await core.message('alice', 'Check both projects', 'cross-project')
+    await core.whenIdle()
+    assert.equal(deliveryTurns.length, 1)
+    assert.deepEqual(deliveryTurns[0].tasks.map(task => task.result).sort(), ['invoice evidence','lobby evidence'])
+    const view = await core.view('alice')
+    assert.equal(view.messages[0].delivery, 'processed')
+    assert.deepEqual(view.messages.map(m => m.text), [
+      'Check both projects','Checking the projects.','One of the two projects has reported.','Both results are ready.',
+    ])
+  } finally { releaseSecond.resolve(); await core.close() }
+})

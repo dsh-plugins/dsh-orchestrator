@@ -31,19 +31,24 @@ export interface Job {
   text: string
   worker?: string | number
   messageId?: string
+  originId?: string
+  deliveryOnly?: boolean
 }
 
 export interface Conversation {
   root: Binding
   previousRoots?: Binding[]
+  awaitingReplies?: Record<string, {rootId: string; plannerIds: string[]; delivered?: boolean}>
   tasks: Task[]
   messages: PublicMessage[]
   requests: string[]
   queue: Job[]
 }
 
-export function enqueue(state: Conversation, target: Binding, text: string, messageId?: string): void {
-  state.queue.push({id: randomUUID(), bindingId: target.id, modelId: target.modelId, hostModel: target.hostModel, text, messageId})
+export function enqueue(state: Conversation, target: Binding, text: string, messageId?: string, originId?: string): Job {
+  const job: Job = {id: randomUUID(), bindingId: target.id, modelId: target.modelId, hostModel: target.hostModel, text, messageId, originId}
+  state.queue.push(job)
+  return job
 }
 
 export class ConversationStore {

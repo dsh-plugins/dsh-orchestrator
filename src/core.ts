@@ -153,7 +153,12 @@ export class Orchestrator {
         state.root.hostModel = this.readHostModel()
         state.root.modelId = state.root.hostModel.id
       }
-      enqueue(state, state.root, JSON.stringify({kind: 'user', text}), messageId)
+      const originId = this.config.useHostModel ? messageId : undefined
+      if (originId) {
+        const awaiting = state.awaitingReplies ??= {}
+        awaiting[originId] = {rootId: state.root.id, plannerIds: []}
+      }
+      enqueue(state, state.root, JSON.stringify({kind: 'user', text}), messageId, originId)
       return this.snapshot(state)
     })
     this.publish(owner)
@@ -261,18 +266,24 @@ export class Orchestrator {
     try {
       const spec = this.spec(owner, actor, job.modelId, parent, job.hostModel)
       const tools: AgentTools = {
-        definitions: structuredClone(toolSets[actor.layer]),
+        definitions: structuredClone(job.deliveryOnly ? toolSets.L1.filter(tool => tool.name === 'send_user') : toolSets[actor.layer]),
         invoke: async (name, args) => {
           const result = this.change(owner, state => {
             if (!state.queue.some(item => item.id === job.id && item.worker === this.store.workerId)) throw new Error('本轮工具权限已失效')
-            return this.invoke(owner, state, actor.id, name, args)
+            if (job.deliveryOnly) {
+              if (name !== 'send_user') throw new Error('This delivery turn can only call send_user')
+              const reply = job.originId && state.awaitingReplies?.[job.originId]
+              if (!reply || reply.delivered) return {sent: true}
+            }
+            return this.invoke(owner, state, actor.id, name, args, job.originId)
           })
           this.publish(owner)
           this.wake(owner)
           return result
         },
       }
-      await this.runner.run(spec, job.text, tools)
+      const input = job.deliveryOnly ? this.finalizationText(owner, job) : job.text
+      await this.runner.run(spec, input, tools)
       succeeded = true
     } catch (error) {
       console.error('[dsh-prism] 会话运行失败', error instanceof Error ? error.message : error)
@@ -287,7 +298,54 @@ export class Orchestrator {
     const message = job.messageId && state.messages.find(item => item.id === job.messageId)
     if (message) message.delivery = ok ? 'processed' : 'failed'
     const task = state.tasks.find(item => item.id === job.bindingId)
-    if (!task) return
+    if (task) this.settleTask(state, task, ok, job.originId)
+    if (job.deliveryOnly && job.originId && state.awaitingReplies?.[job.originId]) {
+      const original = state.messages.find(item => item.id === job.originId)
+      if (original && !state.awaitingReplies[job.originId].delivered) {
+        original.delivery = 'failed'
+        original.deliveryError = 'no_response'
+      }
+      delete state.awaitingReplies[job.originId]
+    }
+    if (state.awaitingReplies) this.finishReplies(state)
+  }
+
+  private finishReplies(state: Conversation): void {
+    for (const [originId, reply] of Object.entries(state.awaitingReplies ?? {})) {
+      if (state.queue.some(job => job.originId === originId)) continue
+      const planners = state.tasks.filter(task => reply.plannerIds.includes(task.id))
+      if (planners.some(task => !terminal(task))) continue
+      if (reply.delivered || !planners.length) {
+        delete state.awaitingReplies![originId]
+        continue
+      }
+
+      // This single delivery job and the receipt are committed together. A silent
+      // final turn fails the original message and consumes the receipt in settle.
+      enqueue(state, binding(state, reply.rootId), '{"kind":"finalize_response"}', undefined, originId).deliveryOnly = true
+    }
+  }
+
+  private finalizationText(owner: string, job: Job): string {
+    const state = this.store.read(owner)
+    const reply = job.originId && state?.awaitingReplies?.[job.originId]
+    const original = state?.messages.find(message => message.id === job.originId)
+    if (!state || !reply || !original) throw new Error('Missing pending delivery request')
+    const tasks = state.tasks.filter(task => reply.plannerIds.includes(task.id)).flatMap(task => {
+      // A grant may have changed between task completion and this last turn.
+      // Reintroduce evidence only for a workspace that is still authorized.
+      try { resolveBinding(this.registry, owner, task.target) } catch { return [] }
+      return [{id: task.id, projectId: task.target.projectId, title: task.title, status: task.status,
+        result: task.finalReport ?? task.progress}]
+    })
+    return JSON.stringify({
+      kind: 'finalize_response',
+      instruction: 'The delegated work has finished. Its final answer has not been delivered to the user. Call the send_user tool now, using the language and format of the specific user request below. Ordinary text is private and never delivered. Use these task results as evidence, sharing only the requested facts. If evidence is missing, explicitly send that limitation.',
+      userRequest: original.text, tasks,
+    })
+  }
+
+  private settleTask(state: Conversation, task: Task, ok: boolean, originId?: string): void {
     const children = state.tasks.filter(child => child.parent === task.id)
     if (!ok) task.turnFailed = true
     if (state.queue.some(item => item.bindingId === task.id) || children.some(child => !terminal(child))) return
@@ -297,10 +355,10 @@ export class Orchestrator {
     enqueue(state, parent, JSON.stringify({
       kind: 'task_settled', taskId: task.id, title: task.title, projectId: task.target.projectId,
       status: task.status, progress: task.progress, result: task.finalReport,
-    }))
+    }), undefined, originId)
   }
 
-  private invoke(owner: string, state: Conversation, id: string, name: string, raw: unknown): unknown {
+  private invoke(owner: string, state: Conversation, id: string, name: string, raw: unknown, originId?: string): unknown {
     const actor = binding(state, id)
     resolveBinding(this.registry, owner, actor.target)
     const definition = toolSets[actor.layer].find(tool => tool.name === name)
@@ -314,6 +372,8 @@ export class Orchestrator {
     switch (name) {
       case 'send_user': {
         state.messages.push({id: randomUUID(), role: 'assistant', text: textField(args.text), at: now()})
+        const reply = originId && state.awaitingReplies?.[originId]
+        if (reply) reply.delivered = !state.tasks.some(task => reply.plannerIds.includes(task.id) && !terminal(task))
         return {sent: true}
       }
       case 'query_projects': {
@@ -324,7 +384,7 @@ export class Orchestrator {
       }
       case 'list_models': return publicCatalog(this.currentConfig().models[actor.layer === 'L1' ? 'L2' : 'L3'])
       case 'dispatch_planner':
-      case 'dispatch_executor': return this.dispatch(owner, state, actor, args)
+      case 'dispatch_executor': return this.dispatch(owner, state, actor, args, originId)
       case 'report_progress': {
         const task = state.tasks.find(task => task.id === id)!
         task.progress = textField(args.text)
@@ -342,7 +402,7 @@ export class Orchestrator {
           task.finalReport = text
           return {recorded: true, delivery: 'task_settled'}
         }
-        enqueue(state, binding(state, task.parent), JSON.stringify({kind: 'child_message', taskId: task.id, text}))
+        enqueue(state, binding(state, task.parent), JSON.stringify({kind: 'child_message', taskId: task.id, text}), undefined, originId)
         return {sent: true}
       }
       case 'get_progress':
@@ -358,14 +418,19 @@ export class Orchestrator {
         }
         if (terminal(child)) { child.status = 'queued'; child.turnFailed = false; child.at = now() }
         delete child.finalReport
-        enqueue(state, child, JSON.stringify({kind: 'parent_message', text: textField(args.text)}))
+        const reply = originId && state.awaitingReplies?.[originId]
+        if (reply && actor.layer === 'L1') {
+          reply.delivered = false
+          if (!reply.plannerIds.includes(child.id)) reply.plannerIds.push(child.id)
+        }
+        enqueue(state, child, JSON.stringify({kind: 'parent_message', text: textField(args.text)}), undefined, originId)
         return {sent: true}
       }
       default: throw new Error('未知工具')
     }
   }
 
-  private dispatch(owner: string, state: Conversation, actor: Binding, args: Record<string, unknown>): {taskId: string} {
+  private dispatch(owner: string, state: Conversation, actor: Binding, args: Record<string, unknown>, originId?: string): {taskId: string} {
     const layer = actor.layer === 'L1' ? 'L2' : 'L3'
     const model = modelFor(this.currentConfig(), layer, textField(args.modelId, 256))
     const projectId = layer === 'L2' ? textField(args.projectId, 1024) : actor.target.projectId
@@ -379,7 +444,12 @@ export class Orchestrator {
       parent: actor.id, title: textField(args.title, 240), progress: '', at: now(), status: 'queued',
     }
     state.tasks.push(task)
-    enqueue(state, task, JSON.stringify({kind: 'assignment', text: textField(args.instruction), projectId, permissions: task.ceiling}))
+    const reply = originId && state.awaitingReplies?.[originId]
+    if (reply && layer === 'L2') {
+      reply.delivered = false
+      reply.plannerIds.push(task.id)
+    }
+    enqueue(state, task, JSON.stringify({kind: 'assignment', text: textField(args.instruction), projectId, permissions: task.ceiling}), undefined, originId)
     return {taskId: task.id}
   }
 

@@ -83,6 +83,7 @@ export interface PublicMessage {
   id: string
   role: 'user' | 'assistant'
   delivery?: 'pending' | 'processed' | 'failed'
+  deliveryError?: 'no_response'
   text: string
   at: string
 }
