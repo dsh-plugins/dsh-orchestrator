@@ -7,7 +7,7 @@ import {externalNotificationPrompt, modelFor, nativeExecutionTools, permittedMod
 import {ConversationStore, enqueue, type Binding, type Conversation, type Job, type Task} from './store.js'
 import {extensionTools, memoryQueries, toolArguments, type MediaAsset, type MediaUpload,
   type PrismExtensions, type Specialist, type TriggerEvent} from './extensions.js'
-import {batchSpawn, hasMember, peerPayload, peerSend, roomPayload, type MeshPort, type PeerInboxMessage,
+import {batchSpawn, hasMember, peerPayload, peerSend, roomLocalNode, roomPayload, type MeshPort, type PeerInboxMessage,
   type PeerMessage, type Room} from './mesh-port.js'
 
 export type * from './contracts.js'
@@ -523,7 +523,7 @@ export class Orchestrator {
 
   private async dispatchProject(owner: string, args: Record<string, unknown>): Promise<ProjectMetadata | undefined> {
     const mesh = this.profile?.mesh
-    if (!mesh || args.nodeId === undefined || args.nodeId === mesh.nodeId) { return undefined }
+    if (!mesh || args.nodeId === undefined || args.nodeId === mesh.nodeId || args.nodeId === mesh.wireNodeId) { return undefined }
     return this.remoteProject(owner, textField(args.nodeId, 128), textField(args.projectId, 1024))
   }
 
@@ -557,7 +557,11 @@ export class Orchestrator {
       if (spec.parentBindingId !== undefined || (this.config.defaultProjectId !== undefined && spec.workspace.projectId !== this.config.defaultProjectId)) throw new Error('交互会话必须绑定默认项目')
     } else { textField(spec.parentBindingId, 256) }
     const project = this.registry.resolve(spec.owner, spec.workspace.projectId, 'configured')
-    if (project.nodeId !== spec.workspace.nodeId) throw new Error('项目节点不匹配')
+    const mesh = this.profile?.mesh
+    if (project.nodeId !== spec.workspace.nodeId &&
+        !(mesh && project.nodeId === mesh.nodeId && spec.workspace.nodeId === mesh.wireNodeId)) {
+      throw new Error('项目节点不匹配')
+    }
     const model = remoteModelFor(this.currentConfig(), spec.layer, spec.model.id)
     if (!Array.isArray(spec.allowedTools)) throw new Error('缺少权限声明')
     const allowedTools = narrow(spec.layer === 'L3' ? this.ceiling(project) : [], spec.allowedTools)
@@ -981,8 +985,10 @@ export class Orchestrator {
       : remote ? {projectId, nodeId: remote.nodeId, cwd: '', discovered: true}
       : local ? {projectId, nodeId: local.nodeId, cwd: local.workspace}
       : {projectId, nodeId: this.profile!.workspace.nodeId, cwd: this.specialistWorkspace(specialist!)}
+    const mesh = this.profile?.mesh
+    const localWireAddress = mesh && target.nodeId === mesh.nodeId && args.nodeId === mesh.wireNodeId
     if ((local && target.cwd !== local.workspace) || (project && target.nodeId !== project.nodeId) ||
-      (args.nodeId !== undefined && args.nodeId !== target.nodeId)) {
+      (args.nodeId !== undefined && args.nodeId !== target.nodeId && !localWireAddress)) {
       throw new Error('项目绑定已变更')
     }
     const ceiling = project ? this.ceiling(project).filter(name => layer === 'L2' || actor.ceiling.includes(name)) : []
@@ -1029,8 +1035,9 @@ export class Orchestrator {
       this.dispatch(owner, state, actor, args, job.originId, undefined, project, requestedDepth))
     const tasks = assignmentsById.map(({taskId}) => state.tasks.find(task => task.id === taskId)!)
     if (!share) { return {tasks: assignmentsById} }
-    const room = {id: randomUUID(), coordinatorNode: mesh.nodeId,
-      members: tasks.map(task => ({agentId: task.id, nodeId: task.target.nodeId}))}
+    const local = tasks.some(task => task.target.nodeId !== mesh.nodeId) ? mesh.wireNodeId ?? mesh.nodeId : mesh.nodeId
+    const room = {id: randomUUID(), coordinatorNode: local,
+      members: tasks.map(task => ({agentId: task.id, nodeId: task.target.nodeId === mesh.nodeId ? local : task.target.nodeId}))}
     const authorized = {...room, grant: mesh.sign(roomPayload(room))}
     for (const task of tasks) { task.room = authorized }
     return {tasks: assignmentsById, room}
@@ -1052,7 +1059,7 @@ export class Orchestrator {
     const args = toolArguments(peerSend, raw)
     const nodeId = textField(args.target_node, 128)
     const agentId = textField(args.target_agent_id, 128)
-    if (!hasMember(room, mesh.nodeId, spec.bindingId) || !hasMember(room, nodeId, agentId) ||
+    if (!hasMember(room, roomLocalNode(mesh, room), spec.bindingId) || !hasMember(room, nodeId, agentId) ||
       agentId === spec.bindingId) {
       throw new Error('目标超出本批 L2 Room')
     }
@@ -1068,28 +1075,31 @@ export class Orchestrator {
   /** 目标节点验证直接相连的发送设备，再将收件交给持久队列。 */
   async receivePeerMessage(sourceNodeId: string, message: PeerMessage, signal?: AbortSignal): Promise<void> {
     const mesh = this.verifyRoom(message.room)
+    const local = roomLocalNode(mesh, message.room)
     if (!hasMember(message.room, sourceNodeId, message.senderAgentId) ||
-      !hasMember(message.room, mesh.nodeId, message.targetAgentId) ||
-      !mesh.verify(sourceNodeId, peerPayload(message, mesh.nodeId), message.proof)) {
+      !hasMember(message.room, local, message.targetAgentId) ||
+      !mesh.verify(sourceNodeId, peerPayload(message, local), message.proof)) {
       throw new Error('Room 消息发送者或目标无效')
     }
-    await mesh.submitPeerInbox(message.room.coordinatorNode, {...message, sourceNodeId, targetNodeId: mesh.nodeId}, signal)
+    await mesh.submitPeerInbox(message.room.coordinatorNode, {...message, sourceNodeId, targetNodeId: local}, signal)
   }
 
   /** 协调节点以任务的原请求身份复核权限，并在确认前写入 Inbox。 */
   async acceptPeerInbox(fromTargetNodeId: string, message: PeerInboxMessage): Promise<void> {
     const {room, sourceNodeId, targetNodeId, senderAgentId, targetAgentId} = message
     const mesh = this.verifyRoom(room)
-    if (this.stopping || room.coordinatorNode !== mesh.nodeId || fromTargetNodeId !== targetNodeId ||
+    const local = roomLocalNode(mesh, room)
+    if (this.stopping || room.coordinatorNode !== local || fromTargetNodeId !== targetNodeId ||
       !hasMember(room, sourceNodeId, senderAgentId) || !hasMember(room, targetNodeId, targetAgentId) ||
       !mesh.verify(sourceNodeId, peerPayload(message, targetNodeId), message.proof)) {
       throw new Error('Room 消息发送者或目标无效')
     }
     const receipt = JSON.stringify([room.id, sourceNodeId, senderAgentId, targetNodeId, targetAgentId,
       textField(message.messageId, 128)])
+    const address = (task: Task) => task.target.nodeId === mesh.nodeId ? local : task.target.nodeId
     const activeMembers = (state: Conversation) => {
-      const sender = state.tasks.find(task => task.id === senderAgentId && task.target.nodeId === sourceNodeId)
-      const target = state.tasks.find(task => task.id === targetAgentId && task.target.nodeId === targetNodeId)
+      const sender = state.tasks.find(task => task.id === senderAgentId && address(task) === sourceNodeId)
+      const target = state.tasks.find(task => task.id === targetAgentId && address(task) === targetNodeId)
       if (!sender || !target || sender === target || sender.layer !== 'L2' || target.layer !== 'L2' ||
         terminal(sender) || terminal(target) || sender.room?.grant !== room.grant ||
         target.room?.grant !== room.grant || sender.originId !== target.originId) {

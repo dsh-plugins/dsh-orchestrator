@@ -26,6 +26,7 @@ export type Config = (OrchestratorConfig | HostModelConfig) & { stateDirectory?:
 
 interface MeshService extends MeshPort {
   runnerFor(nodeId: string): SessionRunner
+  onNodesChanged?(listener: () => void): () => void
   attach(worker: {
     runner: SessionRunner
     authorize(spec: TurnSpec): TurnSpec
@@ -86,10 +87,23 @@ export async function apply(ctx: Context, config: Config) {
     : ctx.prismRegistry
   const local = new DshSessionRunner(ctx, directory, registry)
   ctx.on('agent/created', ({agent}) => local.guardHistoryAgent(agent), { prepend: true })
-  for (const id of [mesh.nodeId, ...mesh.nodeIds]) {
-    const provider = new PrismProvider(id, id === mesh.nodeId ? local : mesh.runnerFor(id))
-    ctx.subagents.registerProvider(provider)
+  const providers = new Map<string, () => void>()
+  const syncProviders = () => {
+    const nodes = new Set([mesh.nodeId, ...mesh.nodeIds])
+    for (const [id, dispose] of providers) {
+      if (!nodes.has(id)) {
+        dispose()
+        providers.delete(id)
+      }
+    }
+    for (const id of nodes) {
+      if (!providers.has(id)) {
+        providers.set(id, ctx.subagents.registerProvider(new PrismProvider(id, id === mesh.nodeId ? local : mesh.runnerFor(id))))
+      }
+    }
   }
+  syncProviders()
+  const unwatchNodes = mesh.onNodesChanged?.(syncProviders)
   const router = new ProviderRouter(ctx.subagents)
   const core = new Orchestrator(config, registry, router, directory, () => {
     const { provider, model } = ctx.agentDefaultModel.currentSelection()
@@ -117,6 +131,9 @@ export async function apply(ctx: Context, config: Config) {
     invokePeerTool: (spec, args, signal) => core.invokePeerTool(spec, args, signal),
   })
   const close = async () => {
+    unwatchNodes?.()
+    for (const dispose of providers.values()) { dispose() }
+    providers.clear()
     router.close()
     detach()
     await Promise.all([core.close(), local.close()])

@@ -6,7 +6,12 @@ import {join} from 'node:path'
 import {tmpdir} from 'node:os'
 import {Orchestrator} from '../dist/core.js'
 
-test('Room receipts admit only live addressed L2 members and deduplicate replay across nodes', async () => {
+test('Room receipts admit only live addressed L2 members and deduplicate replay across nodes', async t => {
+  await t.test('statically configured nodes', () => verifyRoomReceipts(false))
+  await t.test('paired nodes with the same local session ID', () => verifyRoomReceipts(true))
+})
+
+async function verifyRoomReceipts(paired) {
   const dir = await mkdtemp(join(tmpdir(), 'prism-room-'))
   const projects = {
     a: {id: 'project', nodeId: 'a', description: '资料', stack: [], permissions: ['read']},
@@ -22,28 +27,31 @@ test('Room receipts admit only live addressed L2 members and deduplicate replay 
   function signature(node, message) {
     return createHmac('sha256', 'test-' + node).update(message).digest('base64url')
   }
-  function mesh(nodeId) {
-    return {nodeId, nodeIds: ['a', 'b', 'hub'].filter(node => node !== nodeId),
+  function mesh(wireNodeId) {
+    const nodeId = paired ? 'local' : wireNodeId
+    return {nodeId, wireNodeId, nodeIds: ['a', 'b', 'hub'].filter(node => node !== wireNodeId),
       async queryProjects(node) { return projects[node] ? [projects[node]] : [] },
-      sign: value => signature(nodeId, value),
+      sign: value => signature(wireNodeId, value),
       verify: (node, value, proof) => signature(node, value) === proof,
       async peerSend(target, content) {
-        return workers.get(target.nodeId).receivePeerMessage(nodeId, {...content, targetAgentId: target.agentId})
+        return workers.get(target.nodeId).receivePeerMessage(wireNodeId, {...content, targetAgentId: target.agentId})
       },
       async submitPeerInbox(_, message) {
         replay = message
         await assert.rejects(core.acceptPeerInbox('hub', message))
-        await assert.rejects(core.acceptPeerInbox(nodeId, {...message, text: 'tampered'}))
-        await core.acceptPeerInbox(nodeId, message)
-        await core.acceptPeerInbox(nodeId, message)
+        await assert.rejects(core.acceptPeerInbox(wireNodeId, {...message, text: 'tampered'}))
+        await core.acceptPeerInbox(wireNodeId, message)
+        await core.acceptPeerInbox(wireNodeId, message)
       },
     }
   }
   const workers = new Map()
   for (const nodeId of ['a', 'b']) {
+    const port = mesh(nodeId)
     workers.set(nodeId, new Orchestrator({models}, {}, {}, join(dir, nodeId),
-      undefined, undefined, {workspace: {nodeId, projectId: 'prism-conversation', cwd: dir}, mesh: mesh(nodeId)}))
+      undefined, undefined, {workspace: {nodeId: port.nodeId, projectId: 'prism-conversation', cwd: dir}, mesh: port}))
   }
+  const coordinator = mesh('hub')
   core = new Orchestrator({models, maxDepth: 2}, {query: () => []}, {
     async run(spec, raw, tools) {
       const event = JSON.parse(raw)
@@ -83,7 +91,7 @@ test('Room receipts admit only live addressed L2 members and deduplicate replay 
         throw error
       }
     },
-  }, join(dir, 'hub'), undefined, undefined, {workspace: {nodeId: 'hub', projectId: 'prism-conversation', cwd: dir}, mesh: mesh('hub')})
+  }, join(dir, 'hub'), undefined, undefined, {workspace: {nodeId: coordinator.nodeId, projectId: 'prism-conversation', cwd: dir}, mesh: coordinator})
   try {
     await core.message('web:owner', '联合调查', 'message')
     await core.whenIdle()
@@ -98,4 +106,4 @@ test('Room receipts admit only live addressed L2 members and deduplicate replay 
     await Promise.all([core.close(), ...[...workers.values()].map(worker => worker.close())])
     await rm(dir, {recursive: true, force: true})
   }
-})
+}

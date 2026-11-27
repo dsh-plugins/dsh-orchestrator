@@ -27,6 +27,7 @@ export interface PeerInboxMessage extends PeerMessage {
 /** 执行和授权留在编排器，Mesh 提供设备连接及身份凭据。 */
 export interface MeshPort {
   nodeId: string
+  wireNodeId?: string
   nodeIds: readonly string[]
   queryProjects(nodeId: string, owner: string, search?: string, signal?: AbortSignal): Promise<ProjectMetadata[]>
   peerSend(target: {nodeId: string; agentId: string}, message: Omit<PeerMessage, 'targetAgentId'>,
@@ -34,6 +35,11 @@ export interface MeshPort {
   submitPeerInbox(coordinatorNode: string, message: PeerInboxMessage, signal?: AbortSignal): Promise<void>
   sign(data: string): string
   verify(nodeId: string, data: string, signature: string): boolean
+}
+
+/** 旧的纯本机 Room 继续使用签发时的本机逻辑 ID。 */
+export function roomLocalNode(mesh: MeshPort, room: Pick<Room, 'coordinatorNode'>): string {
+  return room.coordinatorNode === mesh.nodeId ? mesh.nodeId : mesh.wireNodeId ?? mesh.nodeId
 }
 
 const string = {type: 'string'}
