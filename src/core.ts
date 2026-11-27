@@ -956,6 +956,13 @@ export class Orchestrator {
       return memory.write(input, key, authorize)
     }
     if (triggers && origin.source.channel !== 'trigger') {
+      if (name === 'event_add_cron') {
+        const expression = textField(args.expression, 160)
+        const timezone = args.timezone === undefined ? undefined : textField(args.timezone, 96)
+        const params = {expression, ...(timezone !== undefined && {timezone}),
+          ...(args.payload !== undefined && {payload: textField(args.payload, 16 * 1024)})}
+        return triggers.add({providerId: 'cron', params}, origin, authorize)
+      }
       if (name === 'event_add') {
         return triggers.add({providerId: textField(args.providerId, 128), params: args.params}, origin, authorize)
       }

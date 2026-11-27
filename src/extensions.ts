@@ -91,7 +91,12 @@ const memoryWrite = tool('memory_write', '保存整理后的长期记忆。附�
 const eventPublish = tool('event_provider_publish', '编译、验证并挂载 TypeScript 事件 Provider。', {providerId: string, source: string})
 const triggerTools = [
   eventSpawn,
-  tool('event_add', '订阅事件 Provider。cron 使用 expression、timezone、payload。msp 使用 nodeId、path、cooldownMs 和 changeOnly。', {
+  tool('event_add_cron', '订阅 Cron 定时事件。使用五段或六段表达式，可指定 IANA 时区和提醒内容。', {
+    expression: {...string, description: 'Cron 表达式，六段格式的第一段为秒。'},
+    timezone: {...string, description: 'IANA 时区，例如 Asia/Singapore。默认为 UTC。'},
+    payload: {...string, description: '触发时送回当前对话的提醒文字。'},
+  }, ['expression']),
+  tool('event_add', '订阅自定义或 MSP 事件 Provider。MSP 的 params 对象可包含 nodeId、path、cooldownMs 和 changeOnly。Cron 订阅优先使用 event_add_cron。需要结构化载荷时，可在此工具传入 Cron 的 params 对象。', {
     providerId: string, params: {description: '由 Provider 定义的 JSON 参数，可省略。'},
   }, ['providerId']),
   tool('event_remove', '移除当前渠道身份创建的事件订阅。', {id: string}),

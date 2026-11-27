@@ -13,6 +13,7 @@ test('specialist grants and staged assets remain bound to the originating reques
   const failures = []
   const documents = []
   const seen = []
+  const subscriptions = []
   let route
   let ordinaryBindingId
   const testAsset = {assetId: 'asset-a', mimeType: 'image/png'}
@@ -28,7 +29,8 @@ test('specialist grants and staged assets remain bound to the originating reques
   }
   const triggers = {
     workspace: workspaces.events,
-    async add(_options, addressed) {
+    async add(options, addressed) {
+      subscriptions.push(options)
       route = addressed
       return {id: 'subscription'}
     },
@@ -42,6 +44,7 @@ test('specialist grants and staged assets remain bound to the originating reques
       try {
         if (event.kind === 'trigger_event') {
           assert.ok(!names.includes('event_add'))
+          assert.ok(!names.includes('event_add_cron'))
           assert.equal(event.source.sender, 'cron')
           await invoke('send_user', {text: '定时通知', final: true, replyTo: event.replyTo})
         } else if (event.kind === 'external.trigger') {
@@ -61,7 +64,16 @@ test('specialist grants and staged assets remain bound to the originating reques
           ordinaryBindingId = spec.bindingId
           assert.deepEqual(event.attachments, [testAsset])
           await assert.rejects(invoke('memory_write', {title: 'x', body: 'y'}))
-          await invoke('event_add', {providerId: 'cron', params: {expression: '* * * * *'}})
+          const cron = tools.definitions.find(tool => tool.name === 'event_add_cron').parameters
+          assert.deepEqual(cron.required, ['expression'])
+          assert.deepEqual(Object.fromEntries(Object.entries(cron.properties).map(([key, value]) => [key, value.type])),
+            {expression: 'string', timezone: 'string', payload: 'string'})
+          assert.match(tools.definitions.find(tool => tool.name === 'event_add').description, /Cron 订阅优先使用 event_add_cron/)
+          await assert.rejects(invoke('event_add_cron', {payload: '没有时间表'}))
+          await invoke('event_add_cron', {expression: '* * * * *'})
+          await invoke('event_add_cron', {expression: '0 9 * * *', timezone: 'Asia/Singapore', payload: '定时提醒'})
+          await invoke('event_add', {providerId: 'cron', params: {expression: '* * * * *', payload: {topic: '旧接口'}}})
+          await invoke('event_add', {providerId: 'custom-counter', params: 7})
           await invoke('spawn_memory_agent', {title: '保存', modelId: 'worker', instruction: '保存附件'})
         } else if (event.kind === 'assignment') {
           assert.equal(spec.workspace.cwd, workspaces.memories)
@@ -92,6 +104,12 @@ test('specialist grants and staged assets remain bound to the originating reques
     await core.whenIdle()
     assert.deepEqual((await core.readMedia('web:owner', 'asset-a')).bytes, Uint8Array.of(1))
     assert.equal(documents.length, 1)
+    assert.deepEqual(subscriptions, [
+      {providerId: 'cron', params: {expression: '* * * * *'}},
+      {providerId: 'cron', params: {expression: '0 9 * * *', timezone: 'Asia/Singapore', payload: '定时提醒'}},
+      {providerId: 'cron', params: {expression: '* * * * *', payload: {topic: '旧接口'}}},
+      {providerId: 'custom-counter', params: 7},
+    ])
     const event = {eventId: 'stable', source: 'cron', payload: {hello: true}, occurredAt: new Date().toISOString(), route}
     await Promise.all([core.acceptTrigger(event), core.acceptTrigger(event)])
     await core.whenIdle()
