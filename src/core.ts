@@ -377,6 +377,10 @@ export class Orchestrator {
   async acceptTrigger(event: TriggerEvent): Promise<void> {
     if (this.stopping || !this.profile) { throw new Error('事件 Inbox 不可用') }
     const {route} = event
+    const external = event.kind === 'external.trigger'
+    if (external && event.source !== 'msp') {
+      throw new Error('外部事件 Provider 无效')
+    }
     if (this.route(textField(route.principal, 2048)).replyTo !== route.replyTo) {
       throw new Error('事件回复目标无效')
     }
@@ -393,12 +397,14 @@ export class Orchestrator {
       const text = JSON.stringify(payload ?? null)
       textField(text)
       const origins = state.origins ??= {}
-      origins[id] = {...route, source}
+      origins[id] = {...route, source, ...(external && {trust: 'untrusted'})}
       state.messages.push({id, role: 'user', text, source, originId: id, at})
       const awaiting = state.awaitingReplies ??= {}
       awaiting[id] = {rootId: state.root.id, plannerIds: [], hostModel: this.requestModel(state, route.principal)}
       enqueue(state, state.root, JSON.stringify({
-        kind: 'trigger_event', eventId: event.eventId, at: event.occurredAt, payload,
+        kind: external ? 'external.trigger' : 'trigger_event',
+        ...(external && {trust: 'untrusted', provider: 'msp'}),
+        eventId: event.eventId, at: event.occurredAt, payload,
       }), undefined, id)
     })
     this.publish(sharedConversation)
@@ -650,7 +656,8 @@ export class Orchestrator {
       })
       if (actor.layer === 'L1' && this.profile?.mesh) { normalTools.push(batchSpawn) }
       if (actor.layer === 'L2' && actor.room) { normalTools.push(peerSend) }
-      const definitions = job.deliveryOnly ? toolSets.L1.filter(tool => tool.name === 'send_user')
+      const definitions = job.deliveryOnly || origin?.trust === 'untrusted'
+        ? toolSets.L1.filter(tool => tool.name === 'send_user')
         : [...normalTools, ...featureTools]
       const tools: AgentTools = {
         definitions: structuredClone(definitions),

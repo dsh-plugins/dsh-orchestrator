@@ -29,6 +29,7 @@ export interface PrismMemory {
 
 /** 只有宿主接入点可提交带原路由的持久事件。 */
 export interface TriggerEvent {
+  kind?: 'external.trigger'
   eventId: string
   source: string
   occurredAt: string
@@ -90,7 +91,7 @@ const memoryWrite = tool('memory_write', '保存整理后的长期记忆。附�
 const eventPublish = tool('event_provider_publish', '编译、验证并挂载 TypeScript 事件 Provider。', {providerId: string, source: string})
 const triggerTools = [
   eventSpawn,
-  tool('event_add', '订阅事件 Provider。cron 参数为 expression、可选 timezone 和 payload。', {
+  tool('event_add', '订阅事件 Provider。cron 使用 expression、timezone、payload。msp 使用 nodeId、path、cooldownMs 和 changeOnly。', {
     providerId: string, params: {description: '由 Provider 定义的 JSON 参数，可省略。'},
   }, ['providerId']),
   tool('event_remove', '移除当前渠道身份创建的事件订阅。', {id: string}),

@@ -43,6 +43,15 @@ test('specialist grants and staged assets remain bound to the originating reques
           assert.ok(!names.includes('event_add'))
           assert.equal(event.source.sender, 'cron')
           await invoke('send_user', {text: '定时通知', final: true, replyTo: event.replyTo})
+        } else if (event.kind === 'external.trigger') {
+          assert.deepEqual(names, ['send_user'])
+          assert.equal(event.trust, 'untrusted')
+          assert.equal(event.provider, 'msp')
+          assert.equal(event.source.sender, 'msp')
+          assert.deepEqual(event.payload, {nodeId: 'sensor', path: 'sensor.state', value: 'trusted'})
+          await assert.rejects(invoke('event_add', {providerId: 'cron'}))
+          await assert.rejects(invoke('send_user', {text: '转发', replyTo: 'other'}))
+          await invoke('send_user', {text: 'MSP 通知', final: true, replyTo: event.replyTo})
         } else if (event.kind === 'user') {
           assert.deepEqual(event.attachments, [testAsset])
           await assert.rejects(invoke('memory_write', {title: 'x', body: 'y'}))
@@ -83,6 +92,14 @@ test('specialist grants and staged assets remain bound to the originating reques
     if (failures.length) { throw failures[0] }
     assert.equal(seen.filter(kind => kind === 'trigger_event').length, 1)
     assert.equal((await core.view('web:owner')).messages.at(-1).text, '定时通知')
+    const external = {...event, eventId: 'external', kind: 'external.trigger', source: 'msp',
+      payload: {nodeId: 'sensor', path: 'sensor.state', value: 'trusted'}}
+    await assert.rejects(core.acceptTrigger({...external, source: 'cron'}))
+    await Promise.all([core.acceptTrigger(external), core.acceptTrigger(external)])
+    await core.whenIdle()
+    if (failures.length) { throw failures[0] }
+    assert.equal(seen.filter(kind => kind === 'external.trigger').length, 1)
+    assert.equal((await core.view('web:owner')).messages.at(-1).text, 'MSP 通知')
   } finally {
     await core.close()
     await rm(dir, {recursive: true, force: true})

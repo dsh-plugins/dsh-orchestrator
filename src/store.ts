@@ -32,6 +32,7 @@ export interface Task extends Binding {
 
 export interface RequestOrigin extends ReplyRoute {
   source: MessageSource
+  trust?: 'untrusted'
 }
 
 export interface Job {
