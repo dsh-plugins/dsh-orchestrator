@@ -11,6 +11,7 @@ import { buildForkSeed, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-ses
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionAlreadyOwnedError } from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-session-query'
+import type {} from '@deepseek-ai/dsh-session-title'
 import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native'
 import { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import type { AgentTools, RegistryPort, SessionRunner, TraceEntry, TurnSpec } from './contracts.js'
@@ -37,6 +38,10 @@ function withinWorkspace(workspace: string, path: string): boolean {
   }
   const target = relative(workspace, realpathSync(resolve(workspace, path)))
   return target !== '..' && !target.startsWith('..' + sep) && !isAbsolute(target)
+}
+
+function visibleInWorkspace(spec: TurnSpec): boolean {
+  return spec.workspaceVisible === true && spec.layer === 'L1' && spec.owner === 'web:owner'
 }
 
 export class DshSessionRunner implements SessionRunner {
@@ -67,6 +72,32 @@ export class DshSessionRunner implements SessionRunner {
     if (!id) return []
     using observation = await this.ctx.sessionQuery.observeSession(id, { projectionMode: 'none' })
     return trace(observation.events)
+  }
+
+  /** 通过原生会话分支恢复旧版交互历史，同时保留原始日志。 */
+  async restoreOwnerSession(spec: TurnSpec): Promise<void> {
+    if (!visibleInWorkspace(spec)) {
+      return
+    }
+    const id = this.bindings.current(spec)
+    const signal = this.shutdown.signal
+    if (!id || this.ctx.workspaceRegistry.archivedSessionIds.includes(id) ||
+      (await this.ctx.sessionPersistence.stat(id, { signal }))?.header.origin !== 'subagent') {
+      return
+    }
+    const lease = await this.ctx.sessionPersistence.open(id, 'write', { signal })
+    try {
+      if (this.bindings.current(spec) !== id) {
+        return
+      }
+      const handle = await this.activate(spec, {
+        definitions: [],
+        async invoke() { throw new Error('恢复会话时不能调用工具') },
+      }, signal)
+      await handle.dispose()
+    } finally {
+      await lease.close()
+    }
   }
 
   close(): Promise<void> {
@@ -161,7 +192,10 @@ export class DshSessionRunner implements SessionRunner {
     return this.ctx.agents.create({
       ...options, seed, inheritedEventCount: SessionLogOffset(count),
       parentSource: { sessionId: source, endSeq: SessionLogOffset(count) },
-      meta: { ...options.meta, parentSession: source, isSeeded: true },
+      meta: {
+        ...options.meta, isSeeded: true,
+        ...(options.meta?.origin === 'subagent' && { parentSession: source }),
+      },
     })
   }
 
@@ -182,11 +216,15 @@ export class DshSessionRunner implements SessionRunner {
       }
     }
     const parentSession = this.bindings.parent(spec)
+    const visible = visibleInWorkspace(spec)
     for (;;) {
       signal.throwIfAborted()
       await this.archive(spec.bindingId)
       const existing = this.bindings.current(spec)
-      if (existing !== undefined) {
+      const legacy = visible && existing !== undefined &&
+        (this.ctx.sessions.get(existing)?.header ?? (await this.ctx.sessionPersistence.stat(existing, { signal }))?.header)
+          ?.origin === 'subagent'
+      if (existing !== undefined && !legacy) {
         try {
           return await this.ctx.agents.resume({ resumeSessionId: existing, setup, signal })
         } catch (error) {
@@ -195,11 +233,17 @@ export class DshSessionRunner implements SessionRunner {
       }
       const options: CreateAgentOptions = {
         sessionId: SessionId('session-' + randomUUID()), setup, signal,
-        meta: { cwd: workspace.path, parentSession, origin: 'subagent', agentPreset: 'prism-' + spec.layer.toLowerCase() },
+        meta: {
+          cwd: workspace.path, parentSession, agentPreset: 'prism-' + spec.layer.toLowerCase(),
+          ...(!visible && { origin: 'subagent' as const }),
+        },
       }
       const handle = existing === undefined ? await this.ctx.agents.create(options) : await this.fork(existing, options)
       let published = false
       try {
+        if (visible && (existing === undefined || legacy)) {
+          this.ctx.get('sessionTitle')?.rename(handle.agent.session, '棱镜')
+        }
         // Materialize even an empty session before publishing its logical identifier.
         await this.ctx.sessions.flush(handle.agent.session)
         await workspace.attachSession(handle.agent.session.id)

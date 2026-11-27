@@ -91,6 +91,30 @@ export class Orchestrator {
     }
   }
 
+  /** 读取本机 Web 所有者已经绑定到工作区的交互历史。 */
+  localWorkspaceSessions(nodeId: string): TurnSpec[] {
+    const owner = 'web:owner'
+    const state = this.store.read(owner)
+    if (!state) {
+      return []
+    }
+    const config = this.currentConfig()
+    return [...(state.previousRoots ?? []), state.root].flatMap(root => {
+      if (root.target.nodeId !== nodeId) {
+        return []
+      }
+      try {
+        return [this.spec(owner, root, this.selectedModel(root, config).id)]
+      } catch (error) {
+        if (error instanceof Error) {
+          console.warn('[dsh-prism] 无法恢复旧工作区会话', error.message)
+          return []
+        }
+        throw error
+      }
+    })
+  }
+
   private defaultModel(config = this.currentConfig()): string {
     return config.defaultL1Model ?? config.models.L1[0].id
   }
@@ -270,6 +294,7 @@ export class Orchestrator {
     const currentCeiling = this.ceiling(project).filter(tool => actor.ceiling.includes(tool))
     return {
       owner, bindingId: actor.id, parentBindingId, layer: actor.layer, model: {...model}, workspace: {...actor.target},
+      ...(actor.layer === 'L1' && owner === 'web:owner' && {workspaceVisible: true}),
       allowedTools: actor.layer === 'L3' ? currentCeiling : [],
       ...(actor.layer === 'L2' && {delegationCeiling: currentCeiling}),
       systemPrompt: systemPrompt(actor.layer, model),

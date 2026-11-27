@@ -8,16 +8,21 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
-test('all layers fork a locked formal DSH session, archive the source and resume the new binding', { timeout: 65_000 }, async () => {
+test('DSH session bindings fork, resume and publish Web owner history', { timeout: 65_000 }, async () => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'prism-host-')))
   const cli = join(dirname(createRequire(import.meta.url).resolve('@deepseek-ai/dsh/package.json')), 'lib/bin.js')
   const probe = fileURLToPath(new URL('./host-lock-probe.mjs', import.meta.url))
+  const fixtureModel = fileURLToPath(new URL('../integration/workspace/test/fixture-model.mjs', import.meta.url))
   const patch = join(dir, 'probe.yml')
   const presets = ['l1', 'l2', 'l3'].map(layer => ({
     id: 'lock-preset-' + layer, name: '@deepseek-ai/dsh-agent-preset',
     config: { id: 'prism-' + layer, plugins: layer === 'l3' ? [{ id: 'file-tools', name: '@deepseek-ai/dsh-tool-fs' }] : [] },
   }))
-  await writeFile(patch, JSON.stringify([{ insert: [...presets, { id: 'lock-probe', name: probe, config: { directory: dir } }] }]))
+  await writeFile(patch, JSON.stringify([{ insert: [
+    ...presets,
+    { id: 'lock-probe-model', name: fixtureModel, config: { logFile: join(dir, 'model.jsonl') } },
+    { id: 'lock-probe', name: probe, config: { directory: dir } },
+  ] }]))
   const proc = spawn(process.execPath, [cli, 'web', '--patch', patch, '--host', '127.0.0.1', '--port', '0', '--no-open'], {
     cwd: dir, env: { ...process.env, DSH_HOME: join(dir, 'dsh'), DSH_AGENTS_HOME: join(dir, 'agents'), DSH_TELEMETRY_DISABLED: '1' },
     detached: true, stdio: ['ignore', 'pipe', 'pipe'],

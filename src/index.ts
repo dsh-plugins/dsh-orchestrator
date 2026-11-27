@@ -59,6 +59,14 @@ export async function apply(ctx: Context, config: Config) {
     await Promise.all([core.close(), local.close()])
   }
   try {
+    for (const spec of core.localWorkspaceSessions(mesh.nodeId)) {
+      try {
+        await local.restoreOwnerSession(spec)
+      } catch (error) {
+        ctx.logger.warn('无法恢复棱镜工作区会话 %s', spec.bindingId)
+        ctx.logger.warn(error)
+      }
+    }
     await core.start()
     ctx.provide('prism', core)
   } catch (error) {

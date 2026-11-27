@@ -4,7 +4,7 @@ import { DshSessionRunner } from '../dist/host.js'
 
 export const name = 'prism-lock-probe'
 export const inject = ['agents', 'sessions', 'agentLoop', 'agentPresets', 'sessionPersistence',
-  'sessionQuery', 'systemPrompt', 'tools', 'workspaceRegistry', 'webServer']
+  'sessionQuery', 'sessionTitle', 'systemPrompt', 'tools', 'llm', 'workspaceRegistry', 'webServer']
 
 export function apply(ctx, config) {
   // A preset declaration and service mount can finish in different Cordis fibers.
@@ -65,6 +65,46 @@ export function apply(ctx, config) {
         }
       }
       assert.equal(new Set(ids).size, layers.length)
+      while (!ctx.llm.listProviders().some(provider => provider.id === 'prism-probe')) {
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      const session = bindingId => ({
+        bindingId, owner: 'web:owner', layer: 'L1',
+        workspace: { projectId: 'test', nodeId: 'local', cwd: config.directory },
+        model: { id: 'alternative', provider: 'prism-probe', description: '' },
+        systemPrompt: '测试棱镜交互会话', allowedTools: [],
+      })
+      const workspace = ctx.workspaceRegistry.list().find(workspace => workspace.path === config.directory)
+      assert.ok(workspace)
+      const run = async (spec, text) => {
+        let id
+        await host.run(spec, JSON.stringify({ kind: 'user', text }), {
+          definitions: [],
+          async invoke() { throw new Error('未预期的工具调用') },
+        }, undefined, value => { id = value })
+        assert.ok(id)
+        return id
+      }
+      const oldSpec = session('old-owner')
+      const oldId = await run(oldSpec, '原始会话内容')
+      assert.equal((await ctx.sessionPersistence.stat(oldId)).header.origin, 'subagent')
+      const visibleSpec = { ...oldSpec, workspaceVisible: true }
+      await host.restoreOwnerSession(visibleSpec)
+      const restored = workspace.getSessionHeaders().find(header => header.origin === undefined)
+      assert.ok(restored)
+      assert.notEqual(restored.id, oldId)
+      assert.ok(ctx.workspaceRegistry.archivedSessionIds.includes(oldId))
+      assert.equal((await ctx.sessionQuery.readTitle(restored.id)).title, '棱镜')
+      assert.ok((await host.transcript(visibleSpec)).some(entry => entry.text.includes('原始会话内容')))
+      await host.restoreOwnerSession(visibleSpec)
+      assert.equal(await run(visibleSpec, '继续原来的会话'), restored.id)
+
+      const freshId = await run({ ...session('new-owner'), workspaceVisible: true }, '首次交互')
+      assert.ok(workspace.sessionIds.includes(freshId))
+      assert.equal((await ctx.sessionPersistence.stat(freshId)).header.origin, undefined)
+      assert.equal((await ctx.sessionQuery.readTitle(freshId)).title, '棱镜')
+      const imId = await run({ ...session('private-im'), owner: 'im:fixture', workspaceVisible: true }, '私聊内容')
+      assert.equal((await ctx.sessionPersistence.stat(imId)).header.origin, 'subagent')
       process.stdout.write('PRISM_LOCK_OK\n')
     } catch (error) {
       process.stdout.write('PRISM_LOCK_ERROR ' + (error instanceof Error ? error.stack : String(error)) + '\n')
