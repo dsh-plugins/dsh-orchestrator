@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { DshSessionRunner } from '../dist/host.js'
 
@@ -106,6 +108,8 @@ export function apply(ctx, config) {
 
       const planner = { ...session('planner'), layer: 'L2', parentBindingId: 'new-owner' }
       const plannerId = await run(planner, '已取得执行步骤的结果')
+      const worker = { ...session('worker'), layer: 'L3', parentBindingId: 'planner' }
+      const workerId = await run(worker, '已完成执行步骤')
       const lock = await ctx.sessionPersistence.open(freshId, 'write')
       let replacement
       try {
@@ -115,6 +119,10 @@ export function apply(ctx, config) {
       } finally {
         await lock.close()
       }
+      using bindings = new DatabaseSync(join(config.directory, 'sessions.sqlite'))
+      bindings.prepare('INSERT INTO pending_archive VALUES (?, ?)').run('new-owner', freshId)
+      assert.equal(await run({ ...session('new-owner'), workspaceVisible: true }, '继续交互'), replacement)
+      assert.ok(!ctx.workspaceRegistry.archivedSessionIds.includes(freshId))
       assert.equal(await run(planner, '旧父会话仍存在，继续整理结果'), plannerId)
       await ctx.workspaceRegistry.archiveSession(freshId, { stopActivity: true })
       const repaired = await run(planner, '从旧版已归档的父会话恢复汇总')
@@ -122,6 +130,18 @@ export function apply(ctx, config) {
       assert.equal((await ctx.sessionPersistence.stat(repaired)).header.parentSession, replacement)
       assert.ok((await host.transcript(planner)).some(entry => entry.text.includes('已取得执行步骤的结果')))
       assert.equal(await run(planner, '下一轮继续沿用会话'), repaired)
+      const repairedWorker = await run(worker, '沿当前父链继续执行')
+      assert.notEqual(repairedWorker, workerId)
+      assert.equal((await ctx.sessionPersistence.stat(repairedWorker)).header.parentSession, repaired)
+      assert.ok((await host.transcript(worker)).some(entry => entry.text.includes('已完成执行步骤')))
+      const activeLease = await ctx.sessionPersistence.open(repaired, 'write')
+      try {
+        await ctx.workspaceRegistry.archiveSession(repaired, { stopActivity: true })
+        await assert.rejects(run(planner, '手动归档后不能自动续跑'), /棱镜会话已归档/)
+        await assert.rejects(run(worker, '本次工作所属的父会话已归档'), /棱镜父会话已归档/)
+      } finally {
+        await activeLease.close()
+      }
 
       const imId = await run({ ...session('private-im'), owner: 'im:fixture', workspaceVisible: true }, '私聊内容')
       assert.equal((await ctx.sessionPersistence.stat(imId)).header.origin, 'subagent')

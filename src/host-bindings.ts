@@ -56,11 +56,11 @@ export class SessionBindings {
     return SessionId(String(row.session))
   }
 
-  publish(spec: TurnSpec, expected: SessionId | undefined, next: SessionId): boolean {
+  publish(spec: TurnSpec, expected: SessionId | undefined, next: SessionId, parent?: SessionId): boolean {
     this.db.exec('BEGIN IMMEDIATE')
     try {
       const current = this.current(spec)
-      if (current !== expected) {
+      if (current !== expected || this.parent(spec) !== parent) {
         this.db.exec('ROLLBACK')
         return false
       }
@@ -82,6 +82,11 @@ export class SessionBindings {
 
   pending(binding: string): SessionId[] {
     return this.db.prepare('SELECT session FROM pending_archive WHERE binding = ?').all(binding)
+      .map(row => SessionId(String(row.session)))
+  }
+
+  childSessions(binding: string): SessionId[] {
+    return this.db.prepare("SELECT session FROM bindings WHERE json_extract(scope, '$[5]') = ?").all(binding)
       .map(row => SessionId(String(row.session)))
   }
 

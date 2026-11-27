@@ -173,11 +173,40 @@ export class DshSessionRunner implements SessionRunner {
     }
   }
 
-  private async archive(binding: string): Promise<void> {
-    for (const id of this.bindings.pending(binding)) {
-      await this.ctx.workspaceRegistry.archiveSession(id, { stopActivity: true })
+  private async readHeader(id: SessionId, signal: AbortSignal) {
+    return this.ctx.sessions.get(id)?.header ?? (await this.ctx.sessionPersistence.stat(id, { signal }))?.header
+  }
+
+  private async archive(binding: string, signal: AbortSignal): Promise<void> {
+    const pending = this.bindings.pending(binding)
+    if (!pending.length) {
+      return
+    }
+    const children = await Promise.all(this.bindings.childSessions(binding).map(id => this.readHeader(id, signal)))
+    const parents = new Set(children.map(header => header?.parentSession))
+    for (const id of pending) {
+      if (!parents.has(id)) {
+        await this.ctx.workspaceRegistry.archiveSession(id, { stopActivity: true })
+      }
       this.bindings.archived(id)
     }
+  }
+
+  private async archivedLineage(id: SessionId | undefined, signal: AbortSignal): Promise<boolean> {
+    const archived = this.ctx.workspaceRegistry.archivedSessionIds
+    if (!archived.length) {
+      return false
+    }
+    const visited = new Set<SessionId>()
+    while (id !== undefined && !visited.has(id)) {
+      if (archived.includes(id)) {
+        return true
+      }
+      visited.add(id)
+      const header = await this.readHeader(id, signal)
+      id = header?.origin === 'subagent' ? header.parentSession : undefined
+    }
+    return false
   }
 
   private async fork(source: SessionId, options: CreateAgentOptions): Promise<AgentHandle> {
@@ -212,19 +241,23 @@ export class DshSessionRunner implements SessionRunner {
         throw new Error('会话绑定的 DSH 工作区已变更')
       }
     }
-    const parentSession = this.bindings.parent(spec)
     const visible = visibleInWorkspace(spec)
     for (;;) {
       signal.throwIfAborted()
-      await this.archive(spec.bindingId)
+      await this.archive(spec.bindingId, signal)
+      const parentSession = this.bindings.parent(spec)
       const existing = this.bindings.current(spec)
-      const header = existing === undefined ? undefined
-        : this.ctx.sessions.get(existing)?.header ?? (await this.ctx.sessionPersistence.stat(existing, { signal }))?.header
+      if (existing !== undefined && workspaces.archivedSessionIds.includes(existing)) {
+        throw new Error('棱镜会话已归档')
+      }
+      if (await this.archivedLineage(parentSession, signal)) {
+        throw new Error('棱镜父会话已归档')
+      }
+      const header = existing === undefined ? undefined : await this.readHeader(existing, signal)
       const legacy = visible && header?.origin === 'subagent'
       const previousParent = header?.parentSession
-      const retiredParent = existing !== undefined && !workspaces.archivedSessionIds.includes(existing) &&
-        previousParent !== undefined && previousParent !== parentSession &&
-        workspaces.archivedSessionIds.includes(previousParent)
+      const retiredParent = previousParent !== undefined && previousParent !== parentSession &&
+        await this.archivedLineage(previousParent, signal)
       if (existing !== undefined && !legacy && !retiredParent) {
         try {
           return await this.ctx.agents.resume({ resumeSessionId: existing, setup, signal })
@@ -242,15 +275,18 @@ export class DshSessionRunner implements SessionRunner {
       const handle = existing === undefined ? await this.ctx.agents.create(options) : await this.fork(existing, options)
       let published = false
       try {
+        if (existing !== undefined && workspaces.archivedSessionIds.includes(existing)) {
+          throw new Error('棱镜会话已归档')
+        }
         if (visible && (existing === undefined || legacy)) {
           this.ctx.get('sessionTitle')?.rename(handle.agent.session, '棱镜')
         }
         // Materialize even an empty session before publishing its logical identifier.
         await this.ctx.sessions.flush(handle.agent.session)
         await workspace.attachSession(handle.agent.session.id)
-        published = this.bindings.publish(spec, existing, handle.agent.session.id)
+        published = this.bindings.publish(spec, existing, handle.agent.session.id, parentSession)
         if (published) {
-          await this.archive(spec.bindingId)
+          await this.archive(spec.bindingId, signal)
           return handle
         }
       } catch (error) {
