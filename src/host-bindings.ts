@@ -83,7 +83,9 @@ export class SessionBindings {
       return undefined
     }
     const [owner, layer, nodeId, projectId, cwd] = JSON.parse(String(row.scope)) as string[]
-    if (owner !== spec.owner || (spec.layer === 'L2' ? layer !== 'L1' : spec.layer !== 'L3' || layer !== 'L2')
+    const sharedRoot = spec.layer === 'L2' && owner === 'web:owner' && layer === 'L1' &&
+      projectId === 'prism-conversation' && nodeId === spec.workspace.nodeId
+    if ((!sharedRoot && owner !== spec.owner) || (spec.layer === 'L2' ? layer !== 'L1' : spec.layer !== 'L3' || layer !== 'L2')
       || (spec.layer === 'L3' && (projectId !== spec.workspace.projectId || nodeId !== spec.workspace.nodeId || cwd !== spec.workspace.cwd))) {
       throw new Error('Invalid parent session scope')
     }

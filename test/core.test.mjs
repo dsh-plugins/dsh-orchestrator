@@ -22,6 +22,80 @@ const registry = {
   },
 }
 
+test('shared Inbox preserves the original principal and recipient across interleaved turns', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'prism-shared-'))
+  t.after(() => rm(dir, {recursive: true, force: true}))
+  const im = (channel, user) => 'im:' + JSON.stringify([channel, user, user])
+  const alice = im('test', 'alice')
+  const bob = im('test', 'bob')
+  const rootIds = new Set()
+  const failures = []
+  const ids = []
+  const gate = Promise.withResolvers()
+  const projectRegistry = {
+    ...registry,
+    query: owner => registry.query(owner === alice ? 'alice' : owner),
+    resolve(owner, id) {
+      return registry.resolve(owner === alice ? 'alice' : owner, id)
+    },
+  }
+  const core = new Orchestrator(config, projectRegistry, {
+    async run(spec, raw, tools) {
+      const event = JSON.parse(raw)
+      try {
+        if (spec.layer === 'L2') {
+          assert.equal(spec.owner, alice)
+          await gate.promise
+          return tools.invoke('send_parent', {text: 'Alice 的结果', final: true})
+        }
+        rootIds.add(spec.bindingId)
+        if (event.kind === 'user') {
+          ids.push(event.eventId)
+          const projects = await tools.invoke('query_projects', {})
+          assert.equal(projects.some(project => project.id === 'invoice'), event.text === 'Alice')
+          await assert.rejects(tools.invoke('send_user', {replyTo: 'other', text: 'invalid'}))
+          if (event.text === 'Alice') {
+            await tools.invoke('dispatch_planner', {projectId: 'invoice', modelId: 'planner',
+              title: 'Alice 的任务', instruction: '检查项目'})
+            return tools.invoke('send_user', {replyTo: event.replyTo, text: 'Alice 已派发', final: false})
+          }
+          gate.resolve()
+          return tools.invoke('send_user', {replyTo: event.replyTo, text: 'Bob 的答复', final: true})
+        }
+        return tools.invoke('send_user', {replyTo: event.replyTo, text: event.result, final: true})
+      } catch (error) {
+        failures.push(error)
+        gate.resolve()
+        throw error
+      }
+    },
+    async transcript() { return [] },
+  }, dir, undefined, undefined, {workspace: {projectId: 'prism-conversation', nodeId: 'local', cwd: dir}})
+  const permitted = new Set([alice, bob])
+  const stop = core.registerChannelAccess('test', owner => permitted.has(owner))
+  try {
+    await core.start()
+    await core.message(alice, 'Alice', 'same', {channel: 'test', sender: 'Alice'})
+    await core.message(bob, 'Bob', 'same', {channel: 'test', sender: 'Bob'})
+    await core.message(bob, 'Bob', 'same')
+    await core.whenIdle()
+    if (failures.length) { throw failures[0] }
+    assert.equal(rootIds.size, 1)
+    assert.equal(new Set(ids).size, 2)
+    assert.deepEqual((await core.view(alice)).messages.map(message => message.text),
+      ['Alice', 'Alice 已派发', 'Alice 的结果'])
+    assert.deepEqual((await core.view(bob)).messages.map(message => message.text), ['Bob', 'Bob 的答复'])
+    assert.deepEqual((await core.view(bob)).tasks, [])
+    assert.equal((await core.view('web:owner')).messages.length, 5)
+    permitted.delete(alice)
+    await assert.rejects(core.view(alice), {code: 'INVALID_INPUT'})
+  } finally {
+    gate.resolve()
+    stop()
+    await core.close()
+  }
+})
+
 test('three persistent actors enforce grant ceilings, exchange addressed messages and publish only explicit sends', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'prism-core-'))
   t.after(() => rm(dir, {recursive:true, force:true}))

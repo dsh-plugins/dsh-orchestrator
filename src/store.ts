@@ -2,7 +2,7 @@ import {randomUUID} from 'node:crypto'
 import {chmodSync, existsSync, mkdirSync, rmSync} from 'node:fs'
 import {join} from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
-import type {Layer, ModelConfig, PublicMessage, TaskCard, WorkspaceTarget} from './contracts.js'
+import type {Layer, MessageSource, ModelConfig, PublicMessage, ReplyRoute, TaskCard, WorkspaceTarget} from './contracts.js'
 
 export interface Binding {
   id: string
@@ -11,6 +11,7 @@ export interface Binding {
   hostModel?: ModelConfig
   target: WorkspaceTarget
   ceiling: string[]
+  privateWorkspace?: true
 }
 
 export interface Task extends Binding {
@@ -21,6 +22,11 @@ export interface Task extends Binding {
   progress: string
   finalReport?: string
   turnFailed?: boolean
+  originId?: string
+}
+
+export interface RequestOrigin extends ReplyRoute {
+  source: MessageSource
 }
 
 export interface Job {
@@ -40,7 +46,9 @@ export interface Conversation {
   previousRoots?: Binding[]
   awaitingReplies?: Record<string, {rootId: string; plannerIds: string[]; delivered?: boolean; hostModel?: ModelConfig}>
   tasks: Task[]
-  messages: PublicMessage[]
+  messages: (PublicMessage & {originId?: string})[]
+  origins?: Record<string, RequestOrigin>
+  modelChoices?: Record<string, string>
   requests: string[]
   queue: Job[]
 }

@@ -67,6 +67,8 @@ export interface TurnSpec {
   layer: Layer
   /** 本机网页所有者的原生工作区会话标题。此字段不经过 Mesh。 */
   workspaceTitle?: string
+  /** 仅由本机编排器标记的私有工作区。 */
+  internalWorkspace?: boolean
   model: ModelConfig
   workspace: WorkspaceTarget
   /** Native DSH tools only; orchestration capabilities are supplied separately. */
@@ -105,6 +107,19 @@ export interface PublicMessage {
   deliveryError?: 'no_response'
   text: string
   at: string
+  source?: MessageSource
+}
+
+/** 平台路由保留在宿主，模型与网页只看到发送方的展示信息。 */
+export interface MessageSource {
+  channel: string
+  sender?: string
+}
+
+/** 事件与后续任务共同使用的已验证请求身份。 */
+export interface ReplyRoute {
+  principal: string
+  replyTo: string
 }
 
 export interface TaskCard {

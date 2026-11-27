@@ -1,6 +1,6 @@
 import { messages } from './messages.js'
-import {randomUUID} from 'node:crypto'
-import type {AgentTools, ConversationView, HostModelConfig, Layer, ModelConfig, ModelRules, OrchestratorConfig, ProjectMetadata, RegistryPort, SessionRunner, TraceEntry, TurnSpec} from './contracts.js'
+import {createHash, randomUUID} from 'node:crypto'
+import type {AgentTools, ConversationView, HostModelConfig, Layer, MessageSource, ModelConfig, ModelRules, OrchestratorConfig, ProjectMetadata, RegistryPort, ReplyRoute, SessionRunner, TraceEntry, TurnSpec, WorkspaceTarget} from './contracts.js'
 import {modelFor, nativeExecutionTools, permittedModels, remoteModelFor, resolveBinding, systemPrompt, toolSets, validateConfig} from './policy.js'
 import {ConversationStore, enqueue, type Binding, type Conversation, type Job, type Task} from './store.js'
 
@@ -39,17 +39,26 @@ function publicCatalog(models: ModelConfig[]): ConversationView['models'] {
 function now(): string { return new Date().toISOString() }
 function terminal(task: Task): boolean { return task.status === 'completed' || task.status === 'failed' }
 
+const sharedConversation = 'profile:shared'
+const webOwner = 'web:owner'
+
+/** 私有工作区与渠道的生命周期由 Cordis 宿主提供。 */
+export interface ProfileConversation {
+  workspace: WorkspaceTarget
+}
+
 export class Orchestrator {
   private readonly store: ConversationStore
   private readonly config: OrchestratorConfig | HostModelConfig
   private readonly readHostModel?: () => ModelConfig
   private readonly active = new Map<string, Promise<void>>()
   private readonly watchers = new Map<string, Set<(view: ConversationView) => void>>()
+  private readonly channelAccess = new Map<string, (principal: string) => boolean>()
   private stopping = false
 
   constructor(config: OrchestratorConfig | HostModelConfig, private readonly registry: RegistryPort,
     private readonly runner: SessionRunner, stateDirectory: string, hostModel?: () => ModelConfig,
-    private readonly readRules?: () => ModelRules | undefined) {
+    private readonly readRules?: () => ModelRules | undefined, private readonly profile?: ProfileConversation) {
     this.config = structuredClone(config)
     if (config.useHostModel) {
       if (!hostModel) throw new Error('DSH default model selection is unavailable')
@@ -78,6 +87,9 @@ export class Orchestrator {
 
   async start(): Promise<void> {
     for (const owner of this.store.owners()) {
+      if (this.profile && owner !== sharedConversation) {
+        continue
+      }
       this.change(owner, state => {
         // Never repeat a turn that could have already written files or sent a message.
         for (const job of [...state.queue]) {
@@ -93,7 +105,7 @@ export class Orchestrator {
 
   /** 读取本机网页所有者已绑定到工作区的交互及子任务历史。 */
   localWorkspaceSessions(nodeId: string): TurnSpec[] {
-    const owner = 'web:owner'
+    const owner = this.conversationId(webOwner)
     const state = this.store.read(owner)
     if (!state) {
       return []
@@ -106,7 +118,8 @@ export class Orchestrator {
       }
       try {
         const modelId = actor.layer === 'L1' ? this.selectedModel(actor, config).id : actor.modelId
-        return [this.spec(owner, actor, modelId, 'parent' in actor ? actor.parent : undefined)]
+        return [this.spec(this.principal(state, owner, 'originId' in actor ? actor.originId : undefined),
+          actor, modelId, 'parent' in actor ? actor.parent : undefined)]
       } catch (error) {
         if (error instanceof Error) {
           console.warn('[dsh-prism] 无法恢复旧工作区会话', error.message)
@@ -137,6 +150,11 @@ export class Orchestrator {
     return modelFor(config, 'L1', this.defaultModel(config))
   }
 
+  private requestModel(state: Conversation, owner: string, config = this.currentConfig()): ModelConfig {
+    const choice = state.modelChoices?.[this.route(owner).replyTo]
+    return config.models.L1.find(model => model.id === choice) ?? this.selectedModel(state.root, config)
+  }
+
   private newRoot(owner: string, projectId?: string): Binding {
     if (projectId === undefined) throw new PrismError('NO_PROJECT', 'No authorized Prism project is available')
     const project = this.registry.resolve(owner, projectId)
@@ -147,11 +165,21 @@ export class Orchestrator {
   }
 
   private newConversation(owner: string): Conversation {
+    if (owner === sharedConversation && this.profile) {
+      return {
+        root: {id: randomUUID(), layer: 'L1', modelId: this.defaultModel(), ceiling: [],
+          target: this.profile.workspace, privateWorkspace: true},
+        messages: [], tasks: [], requests: [], queue: [],
+      }
+    }
     const projectId = this.config.defaultProjectId ?? this.registry.query(owner)[0]?.id
     return {root: this.newRoot(owner, projectId), messages: [], tasks: [], requests: [], queue: []}
   }
 
   private refreshRoot(owner: string, state: Conversation): void {
+    if (state.root.privateWorkspace) {
+      return
+    }
     if (this.config.defaultProjectId !== undefined) return
     const available = this.registry.query(owner)
     const target = state.root.target
@@ -175,13 +203,53 @@ export class Orchestrator {
     return this.store.change(owner, () => this.newConversation(owner), fn)
   }
 
-  private snapshot(state: Conversation): ConversationView {
+  private conversationId(owner: string): string {
+    textField(owner, 2048)
+    return this.profile ? sharedConversation : owner
+  }
+
+  private principal(state: Conversation, owner: string, originId?: string): string {
+    if (owner !== sharedConversation || !this.profile) {
+      return owner
+    }
+    return (originId && state.origins?.[originId]?.principal) || webOwner
+  }
+
+  /** 仅渠道适配器可登记其已验证私聊的实时授权。 */
+  registerChannelAccess(channelId: string, permits: (principal: string) => boolean): () => void {
+    if (this.channelAccess.has(channelId)) {
+      throw new Error('渠道已登记')
+    }
+    this.channelAccess.set(channelId, permits)
+    this.wake(sharedConversation)
+    return () => { this.channelAccess.delete(channelId) }
+  }
+
+  private access(owner: string): ((principal: string) => boolean) | undefined {
+    try {
+      const [channel] = JSON.parse(owner.slice(3)) as [string, string, string]
+      return owner.startsWith('im:') ? this.channelAccess.get(channel) : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private permits(owner: string): boolean {
+    if (!this.profile || owner === webOwner) {
+      return true
+    }
+    return this.access(owner)?.(owner) === true
+  }
+
+  private snapshot(state: Conversation, viewer: string): ConversationView {
     const config = this.currentConfig()
+    const visible = (originId?: string) => !this.profile || viewer === webOwner ||
+      (originId !== undefined && state.origins?.[originId]?.principal === viewer)
     return {
-      modelId: this.selectedModel(state.root, config).id,
+      modelId: this.requestModel(state, viewer, config).id,
       models: publicCatalog(config.models.L1),
-      messages: state.messages,
-      tasks: state.tasks.map(task => ({
+      messages: state.messages.filter(message => visible(message.originId)).map(({originId: _, ...message}) => message),
+      tasks: state.tasks.filter(task => visible(task.originId)).map(task => ({
         id: task.id, title: task.layer === 'L3' ? '执行步骤' : task.title,
         status: task.status, at: task.at, ...(task.layer === 'L3' ? {parentId: task.parent} : {}),
       })),
@@ -189,56 +257,98 @@ export class Orchestrator {
   }
 
   async view(owner: string): Promise<ConversationView> {
-    textField(owner, 2048)
-    const state = this.store.read(owner)
-    return state ? this.snapshot(state) : this.change(owner, state => this.snapshot(state))
+    const conversation = this.conversationId(owner)
+    if (!this.permits(owner)) {
+      throw new PrismError('INVALID_INPUT', '发送方未获授权')
+    }
+    const state = this.store.read(conversation)
+    return state ? this.snapshot(state, owner) : this.change(conversation, state => this.snapshot(state, owner))
   }
 
-  async message(owner: string, text: string, requestId?: string): Promise<ConversationView> {
+  async message(owner: string, text: string, requestId?: string, source?: MessageSource): Promise<ConversationView> {
     if (this.stopping) throw new Error('服务正在关闭')
     textField(text)
     if (requestId !== undefined) textField(requestId, 1024)
-    const result = this.change(owner, state => {
-      if (requestId && state.requests.includes(requestId)) return this.snapshot(state)
+    const conversation = this.conversationId(owner)
+    if (!this.permits(owner)) {
+      throw new PrismError('INVALID_INPUT', '发送方未获授权')
+    }
+    const eventId = requestId && this.profile
+      ? createHash('sha256').update(JSON.stringify([owner, requestId])).digest('base64url')
+      : requestId
+    const result = this.change(conversation, state => {
+      if (eventId && state.requests.includes(eventId)) return this.snapshot(state, owner)
       this.refreshRoot(owner, state)
-      if (requestId) state.requests.push(requestId)
+      if (eventId) state.requests.push(eventId)
       const messageId = randomUUID()
-      state.messages.push({id: messageId, role: 'user', delivery: 'pending', text, at: now()})
-      if (this.readHostModel) {
+      const at = now()
+      const route = this.profile ? this.route(owner) : undefined
+      const sender = this.profile ? (source ?? {channel: owner === webOwner ? 'web' : 'im'}) : undefined
+      if (route && sender) {
+        const origins = state.origins ??= {}
+        origins[messageId] = {...route, source: sender}
+      }
+      state.messages.push({id: messageId, role: 'user', delivery: 'pending', text, at,
+        ...(sender && {source: sender, originId: messageId})})
+      if (this.readHostModel && !this.profile) {
         state.root.hostModel = this.selectedModel(state.root, this.currentConfig())
         state.root.modelId = state.root.hostModel.id
       }
-      const originId = this.config.useHostModel ? messageId : undefined
+      const originId = this.config.useHostModel || this.profile ? messageId : undefined
       if (originId) {
         const awaiting = state.awaitingReplies ??= {}
-        awaiting[originId] = {rootId: state.root.id, plannerIds: [], hostModel: state.root.hostModel}
+        awaiting[originId] = {rootId: state.root.id, plannerIds: [],
+          hostModel: this.profile ? this.requestModel(state, owner) : state.root.hostModel}
       }
-      enqueue(state, state.root, JSON.stringify({kind: 'user', text}), messageId, originId)
-      return this.snapshot(state)
+      enqueue(state, state.root, JSON.stringify({kind: 'user', text,
+        ...(route && {eventId: eventId ?? messageId, requestId: messageId, source: sender, replyTo: route.replyTo, at}),
+      }), messageId, originId)
+      return this.snapshot(state, owner)
     })
-    this.publish(owner)
-    this.wake(owner)
+    this.publish(conversation)
+    this.wake(conversation)
     return result
+  }
+
+  private route(principal: string): ReplyRoute {
+    return {principal, replyTo: createHash('sha256').update(principal).digest('base64url')}
   }
 
   async selectModel(owner: string, modelId: string): Promise<ConversationView> {
     if (!this.currentConfig().models.L1.some(model => model.id === modelId)) throw new PrismError('INVALID_INPUT', '此交互模型不可用')
-    const view = this.change(owner, state => { state.root.modelId = modelId; return this.snapshot(state) })
-    this.publish(owner)
+    if (!this.permits(owner)) {
+      throw new PrismError('INVALID_INPUT', '发送方未获授权')
+    }
+    const conversation = this.conversationId(owner)
+    const view = this.change(conversation, state => {
+      if (this.profile && owner !== webOwner) {
+        const choices = state.modelChoices ??= {}
+        choices[this.route(owner).replyTo] = modelId
+      } else {
+        state.root.modelId = modelId
+      }
+      return this.snapshot(state, owner)
+    })
+    this.publish(conversation)
     return view
   }
 
   /** 将模型配置变更推送到已打开的对话。 */
   refreshModels(): void {
-    for (const owner of this.watchers.keys()) {
+    for (const owner of new Set([...this.watchers.keys()].map(viewer => this.conversationId(viewer)))) {
       this.publish(owner)
     }
   }
 
   async trace(owner: string, taskId: string): Promise<TraceEntry[]> {
-    const task = this.store.read(textField(owner, 2048))?.tasks.find(task => task.id === taskId)
-    if (!task) throw new PrismError('NOT_FOUND', '找不到此任务')
-    return this.runner.transcript(this.spec(owner, task, task.modelId, task.parent))
+    const conversation = this.conversationId(owner)
+    const state = this.store.read(conversation)
+    const task = state?.tasks.find(task => task.id === taskId)
+    const principal = state && this.principal(state, conversation, task?.originId)
+    if (!task || !principal || (principal !== owner && owner !== webOwner) || !this.permits(owner)) {
+      throw new PrismError('NOT_FOUND', '找不到此任务')
+    }
+    return this.runner.transcript(this.spec(principal, task, task.modelId, task.parent))
   }
 
   subscribe(owner: string, listener: (view: ConversationView) => void): () => void {
@@ -253,11 +363,18 @@ export class Orchestrator {
   }
 
   private publish(owner: string): void {
-    const watchers = this.watchers.get(owner)
-    if (!watchers?.size) return
-    const view = this.snapshot(this.store.read(owner)!)
-    for (const listener of watchers) {
-      try { listener(structuredClone(view)) } catch { /* A detached channel cannot roll back a committed event. */ }
+    const state = this.store.read(owner)
+    if (!state) {
+      return
+    }
+    for (const [viewer, watchers] of this.watchers) {
+      if ((!this.profile && viewer !== owner) || !this.permits(viewer)) {
+        continue
+      }
+      const view = this.snapshot(state, viewer)
+      for (const listener of watchers) {
+        try { listener(structuredClone(view)) } catch { /* A detached channel cannot roll back a committed event. */ }
+      }
     }
   }
 
@@ -287,16 +404,18 @@ export class Orchestrator {
   }
 
   private spec(owner: string, actor: Binding | Task, modelId: string, parentBindingId?: string, hostModel = actor.hostModel): TurnSpec {
-    if (actor.layer === 'L1' && this.config.defaultProjectId !== undefined && actor.target.projectId !== this.config.defaultProjectId) throw new Error('默认项目绑定已变更')
-    const project = resolveBinding(this.registry, owner, actor.target)
+    if (actor.layer === 'L1' && !actor.privateWorkspace && this.config.defaultProjectId !== undefined && actor.target.projectId !== this.config.defaultProjectId) throw new Error('默认项目绑定已变更')
+    const project = actor.privateWorkspace ? undefined : resolveBinding(this.registry, owner, actor.target)
     const config = this.currentConfig()
     const model = this.readHostModel
       ? hostModel ?? config.models[actor.layer].find(choice => choice.id === modelId) ?? config.models[actor.layer][0]
       : modelFor(config, actor.layer, modelId)
-    const currentCeiling = this.ceiling(project).filter(tool => actor.ceiling.includes(tool))
+    const currentCeiling = project ? this.ceiling(project).filter(tool => actor.ceiling.includes(tool)) : []
     return {
-      owner, bindingId: actor.id, parentBindingId, layer: actor.layer, model: {...model}, workspace: {...actor.target},
-      ...(owner === 'web:owner' && {
+      owner: actor.layer === 'L1' && actor.privateWorkspace ? webOwner : owner,
+      bindingId: actor.id, parentBindingId, layer: actor.layer, model: {...model}, workspace: {...actor.target},
+      ...(actor.privateWorkspace && {internalWorkspace: true}),
+      ...((owner === webOwner || this.profile) && {
         workspaceTitle: actor.layer === 'L1' ? '棱镜' : '棱镜 ' + actor.layer + ('title' in actor ? ' · ' + actor.title : ''),
       }),
       allowedTools: actor.layer === 'L3' ? currentCeiling : [],
@@ -310,7 +429,8 @@ export class Orchestrator {
     const state = this.store.read(owner)
     if (!state) return
     for (const id of new Set(state.queue.map(job => job.bindingId))) {
-      if (this.active.has(id) || state.queue.find(job => job.bindingId === id)?.worker) continue
+      const job = this.nextJob(state, owner, id)
+      if (this.active.has(id) || !job || job.worker) continue
       const promise = Promise.resolve().then(() => this.consume(owner, id))
         .catch(error => console.error('[dsh-prism] 无法处理会话队列', error))
         .finally(() => { this.active.delete(id); this.wake(owner) })
@@ -318,9 +438,19 @@ export class Orchestrator {
     }
   }
 
+  private nextJob(state: Conversation, owner: string, id: string): Job | undefined {
+    return state.queue.find(job => {
+      if (job.bindingId !== id) {
+        return false
+      }
+      const principal = this.principal(state, owner, job.originId)
+      return !!job.worker || !this.profile || principal === webOwner || this.access(principal) !== undefined
+    })
+  }
+
   private async consume(owner: string, id: string): Promise<void> {
     const claimed = this.change(owner, state => {
-      const job = state.queue.find(item => item.bindingId === id)
+      const job = this.nextJob(state, owner, id)
       if (!job || job.worker) return
       job.worker = this.store.workerId
       const task = state.tasks.find(task => task.id === id)
@@ -332,25 +462,30 @@ export class Orchestrator {
     const {actor, job, parent} = claimed
     let succeeded = false
     try {
-      const spec = this.spec(owner, actor, job.modelId, parent, job.hostModel)
+      const principal = this.principal(this.store.read(owner)!, owner, job.originId)
+      if (!this.permits(principal)) {
+        throw new Error('渠道授权已撤销')
+      }
+      const spec = this.spec(principal, actor, job.modelId, parent, job.hostModel)
       const tools: AgentTools = {
         definitions: structuredClone(job.deliveryOnly ? toolSets.L1.filter(tool => tool.name === 'send_user') : toolSets[actor.layer]),
         invoke: async (name, args) => {
           const result = this.change(owner, state => {
             if (!state.queue.some(item => item.id === job.id && item.worker === this.store.workerId)) throw new Error('本轮工具权限已失效')
+            if (!this.permits(principal)) throw new Error('渠道授权已撤销')
             if (job.deliveryOnly) {
               if (name !== 'send_user') throw new Error('This delivery turn can only call send_user')
               const reply = job.originId && state.awaitingReplies?.[job.originId]
               if (!reply || reply.delivered) return {sent: true}
             }
-            return this.invoke(owner, state, actor.id, name, args, job)
+            return this.invoke(principal, state, actor.id, name, args, job)
           })
           this.publish(owner)
           this.wake(owner)
           return result
         },
       }
-      const input = job.deliveryOnly ? this.finalizationText(owner, job) : job.text
+      const input = job.deliveryOnly ? this.finalizationText(owner, job) : this.eventText(job, this.store.read(owner)!)
       await this.runner.run(spec, input, tools)
       succeeded = true
     } catch (error) {
@@ -402,15 +537,26 @@ export class Orchestrator {
     const tasks = state.tasks.filter(task => reply.plannerIds.includes(task.id)).flatMap(task => {
       // A grant may have changed between task completion and this last turn.
       // Reintroduce evidence only for a workspace that is still authorized.
-      try { resolveBinding(this.registry, owner, task.target) } catch { return [] }
+      try {
+        if (!task.privateWorkspace) {
+          resolveBinding(this.registry, this.principal(state, owner, job.originId), task.target)
+        }
+      } catch { return [] }
       return [{id: task.id, projectId: task.target.projectId, title: task.title, status: task.status,
         result: task.finalReport ?? task.progress}]
     })
-    return JSON.stringify({
+    return this.eventText(job, state, {
       kind: 'finalize_response',
       instruction: 'The delegated work has finished. Its final answer has not been delivered to the user. Call the send_user tool now with final=true, using the language and format of the specific user request below. Ordinary text is private and never delivered. Use these task results as evidence, sharing only the requested facts. If evidence is missing, explicitly send that limitation.',
       userRequest: original.text, tasks,
     })
+  }
+
+  private eventText(job: Job, state: Conversation, event = JSON.parse(job.text) as Record<string, unknown>): string {
+    const origin = job.originId && state.origins?.[job.originId]
+    return JSON.stringify(origin ? {
+      eventId: job.id, requestId: job.originId, source: origin.source, replyTo: origin.replyTo, ...event,
+    } : event)
   }
 
   private settleTask(state: Conversation, task: Task, ok: boolean, originId?: string): void {
@@ -429,7 +575,9 @@ export class Orchestrator {
   private invoke(owner: string, state: Conversation, id: string, name: string, raw: unknown, job: Job): unknown {
     const {originId, deliveryOnly} = job
     const actor = binding(state, id)
-    resolveBinding(this.registry, owner, actor.target)
+    if (!actor.privateWorkspace) {
+      resolveBinding(this.registry, owner, actor.target)
+    }
     const definition = toolSets[actor.layer].find(tool => tool.name === name)
     if (!definition || !raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('该层无权调用此工具，或参数格式无效')
     const args = raw as Record<string, unknown>
@@ -442,7 +590,11 @@ export class Orchestrator {
       case 'send_user': {
         if (args.final !== undefined && typeof args.final !== 'boolean') throw new PrismError('INVALID_INPUT', 'final 必须为布尔值')
         if (deliveryOnly && args.final === false) throw new PrismError('INVALID_INPUT', '本轮需要发送最终答复')
-        state.messages.push({id: randomUUID(), role: 'assistant', text: textField(args.text), at: now()})
+        const origin = originId && state.origins?.[originId]
+        if (this.profile && (!origin || (args.replyTo !== undefined && args.replyTo !== origin.replyTo))) {
+          throw new PrismError('INVALID_INPUT', '回复目标与原请求不匹配')
+        }
+        state.messages.push({id: randomUUID(), role: 'assistant', text: textField(args.text), at: now(), originId})
         const reply = originId && state.awaitingReplies?.[originId]
         if (reply && args.final !== false) {
           reply.delivered = !state.tasks.some(task => reply.plannerIds.includes(task.id) && !terminal(task))
@@ -480,7 +632,8 @@ export class Orchestrator {
       }
       case 'get_progress':
       case 'send_child': {
-        const child = state.tasks.find(task => task.id === args.taskId && task.parent === id)
+        const child = state.tasks.find(task => task.id === args.taskId && task.parent === id &&
+          (!this.profile || task.originId === originId))
         if (!child) throw new PrismError('NOT_FOUND', '找不到直接子任务')
         if (name === 'get_progress') {
           const children = state.tasks.filter(task => task.parent === child.id).map(({id, title, status, progress}) => ({id, title, status, progress}))
@@ -514,7 +667,7 @@ export class Orchestrator {
     const task: Task = {
       id: randomUUID(), layer, target, modelId: model.id, ceiling: narrow(ceiling, args.permissions),
       ...(this.config.useHostModel && {hostModel: model}),
-      parent: actor.id, title: textField(args.title, 240), progress: '', at: now(), status: 'queued',
+      parent: actor.id, title: textField(args.title, 240), progress: '', at: now(), status: 'queued', originId,
     }
     state.tasks.push(task)
     const reply = originId && state.awaitingReplies?.[originId]

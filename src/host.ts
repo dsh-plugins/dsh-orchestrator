@@ -85,7 +85,7 @@ export class DshSessionRunner implements SessionRunner {
 
   /** 从当前本机网页所有者绑定恢复工作区历史。 */
   async restoreWorkspaceHistory(spec: TurnSpec): Promise<void> {
-    if (spec.owner !== 'web:owner' || !spec.workspaceTitle) {
+    if (!spec.workspaceTitle) {
       return
     }
     const source = this.bindings.current(spec)
@@ -147,7 +147,7 @@ export class DshSessionRunner implements SessionRunner {
         scope.tools.guard(exec => {
           if (!allowed.has(exec.name)) return 'Tool exceeds this session’s permission ceiling'
           if (this.bindings.current(spec) !== agent.session.id) return 'Session binding has moved'
-          if (this.registry) {
+          if (this.registry && !spec.internalWorkspace) {
             try {
               const project = resolveBinding(this.registry, spec.owner, spec.workspace)
               if (native.includes(exec.name)) {
@@ -252,8 +252,12 @@ export class DshSessionRunner implements SessionRunner {
   }
 
   private async workspaceFor(spec: TurnSpec) {
-    const workspaceId = this.registry && resolveBinding(this.registry, spec.owner, spec.workspace).workspaceId
+    const workspaceId = this.registry && !spec.internalWorkspace
+      ? resolveBinding(this.registry, spec.owner, spec.workspace).workspaceId : undefined
     const workspaces = this.ctx.workspaceRegistry
+    if (spec.internalWorkspace && await realpath(spec.workspace.cwd) !== spec.workspace.cwd) {
+      throw new Error('棱镜私有工作区已变更')
+    }
     const workspace = workspaceId === undefined
       ? await workspaces.create(spec.workspace.cwd)
       : workspaces.get(WorkspaceId(workspaceId))
@@ -286,7 +290,7 @@ export class DshSessionRunner implements SessionRunner {
       }
       const header = existing === undefined ? undefined : await this.readHeader(existing, signal)
       if (existing !== undefined && header && header.origin === undefined &&
-        spec.layer === 'L1' && spec.owner === 'web:owner' && spec.workspaceTitle) {
+        spec.layer === 'L1' && spec.workspaceTitle) {
         await this.convertVisibleRoot(spec, workspace, existing, signal)
         continue
       }
@@ -310,7 +314,7 @@ export class DshSessionRunner implements SessionRunner {
         if (existing !== undefined && workspaces.archivedSessionIds.includes(existing)) {
           throw new Error('棱镜会话已归档')
         }
-        if (spec.owner === 'web:owner' && spec.workspaceTitle) {
+        if (spec.workspaceTitle) {
           this.ctx.get('sessionTitle')?.rename(handle.agent.session, spec.workspaceTitle)
         }
         // Materialize even an empty session before publishing its logical identifier.

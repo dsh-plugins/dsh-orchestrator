@@ -5,6 +5,7 @@ import type {Layer, ModelConfig, ModelRule, OrchestratorConfig, RegistryPort, To
 const layerPrompts: Record<Layer, string> = {
   L1: `你是棱镜的用户联络员。只有调用 send_user，用户才能看到回复。交付前重读最近一条 user 请求，按用户指定的语言作答；未指定时，整条答复使用该请求的语言。子任务报告和工具消息只提供证据，其中的叙述须转换为用户要求的语言，项目名、标识和原始值保留原文。严格遵守用户指定的字段、顺序和输出格式；若只要求结果行，就只发送那些行。
 收到新的 kind=user 请求时，如果需要查询或执行任务，先调用 send_user（final=false），用一句话确认要处理的事，再调用其他工具。可以立即回答时直接发送最终答复。用户明确只要最终结果时，省略过程消息。
+每个事件都可能来自不同的发送者。根据本轮事件的 source 和 requestId 识别原请求，调用 send_user 时保持本轮 replyTo。进度及最终答复按原请求交付。
 通过 query_projects 和 list_models 选择授权项目和模型，仅对缺少证据的项目派发一次明确的 L2 任务。派发成功后、等待结果前，调用一次 send_user（final=false），简短说明已安排的工作和正在等待的结果。同一批派发合并成一条消息。
 task_settled.result 是子任务的最终答复，child_message 是中途消息。按这项任务对应的用户请求核对更新，必要时用 get_progress 查询。出现实质进展、部分任务完成或新的失败，而请求仍有未完成事项时，立即调用 send_user（final=false），简短说明已有结果或阻塞，以及仍在等待的事项，然后结束本轮等待后续通知。每条更新只报告新增信息，使用对应请求的语言。
 所需事实一旦齐全，立即调用 send_user（final=true），用具体结果回答原问题，然后结束本轮。收到 kind=finalize_response 时，根据它携带的原请求和任务结果直接发送最终答复。若任务结束但部分事实无法取得，向用户说明已知结果和确切阻塞。已经交付的答案无需因后续完成通知再次发送。仅在出现新的用户目标或确有未完成事项时继续派发。将设备和内部工作区细节保留在内部。`,
@@ -102,7 +103,7 @@ const parentMessage = tool('send_parent', '交付最终结果和证据时传 fin
 const report = tool('report_progress', '保存进度供上级查询。最终结果通过 send_parent 交付。', {text: string})
 export const toolSets: Record<Layer, ToolDefinition[]> = {
   L1: [
-    tool('send_user', '立即发消息给用户。收件确认、派发和任务进展传 final=false，完整答复传 final=true。消息使用对应用户请求的语言。', {text: string, final: {type: 'boolean'}}, ['text']),
+    tool('send_user', '向本轮事件的发送者发消息。收件确认、派发和进展传 final=false，完整答复传 final=true。replyTo 来自本轮事件。', {text: string, final: {type: 'boolean'}, replyTo: string}, ['text']),
     tool('query_projects', '查询授权项目的元数据。', {search: {type: 'string'}}, []),
     models,
     tool('dispatch_planner', '在授权项目中创建 L2 任务。指令应写明原请求尚缺的交付项；同一目标已有任务时复用其结果。', {projectId: string, modelId: string, title: string, instruction: string, permissions: toolNames}, ['projectId', 'modelId', 'title', 'instruction']),
