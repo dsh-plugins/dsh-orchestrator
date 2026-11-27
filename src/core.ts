@@ -3,7 +3,7 @@ import {createHash, randomUUID} from 'node:crypto'
 import {realpathSync} from 'node:fs'
 import {dirname, join} from 'node:path'
 import type {AgentTools, ConversationView, HostModelConfig, Layer, MessageSource, ModelConfig, ModelRules, OrchestratorConfig, ProjectMetadata, RegistryPort, ReplyRoute, SessionRunner, TraceEntry, TurnSpec, WorkspaceTarget} from './contracts.js'
-import {modelFor, nativeExecutionTools, permittedModels, remoteModelFor, resolveBinding, systemPrompt, toolSets, validateConfig} from './policy.js'
+import {externalNotificationPrompt, modelFor, nativeExecutionTools, permittedModels, remoteModelFor, resolveBinding, systemPrompt, toolSets, validateConfig} from './policy.js'
 import {ConversationStore, enqueue, type Binding, type Conversation, type Job, type Task} from './store.js'
 import {extensionTools, memoryQueries, toolArguments, type MediaAsset, type MediaUpload,
   type PrismExtensions, type Specialist, type TriggerEvent} from './extensions.js'
@@ -646,7 +646,11 @@ export class Orchestrator {
         throw new Error('渠道授权已撤销')
       }
       const remote = actor.target.discovered ? await this.currentProject(principal, actor.target) : undefined
-      const spec = this.spec(principal, actor, job.modelId, parent, job.hostModel, remote)
+      const planned = this.spec(principal, actor, job.modelId, parent, job.hostModel, remote)
+      const spec: TurnSpec = origin?.trust === 'untrusted' ? {
+        ...planned, bindingId: job.id, isolatedNotification: true, workspaceTitle: undefined,
+        showWorkspaceHistory: undefined, systemPrompt: externalNotificationPrompt,
+      } : planned
       const extensions = this.profile?.extensions
       const featureTools = extensionTools(actor.layer, actor.specialist, !!extensions?.memory(),
         !!extensions?.triggers(), origin?.source.channel === 'trigger' ? false : !!origin)

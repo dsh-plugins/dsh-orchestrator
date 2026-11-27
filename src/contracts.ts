@@ -80,6 +80,8 @@ export interface TurnSpec {
   showWorkspaceHistory?: true
   /** 仅由本机编排器标记的私有工作区。 */
   internalWorkspace?: boolean
+  /** 外部通知单轮执行，独立于对话、Agent 绑定与工作区历史。 */
+  isolatedNotification?: true
   model: ModelConfig
   workspace: WorkspaceTarget
   /** Native DSH tools only; orchestration capabilities are supplied separately. */

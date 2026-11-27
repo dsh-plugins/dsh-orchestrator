@@ -146,7 +146,10 @@ export class DshSessionRunner implements SessionRunner {
         const allowed = new Set([...native, ...tools.definitions.map(tool => tool.name)])
         scope.tools.guard(exec => {
           if (!allowed.has(exec.name)) return 'Tool exceeds this session’s permission ceiling'
-          if (this.bindings.current(spec) !== agent.session.id) return 'Session binding has moved'
+          const current = spec.isolatedNotification
+            ? this.live.get(spec.bindingId)?.session.id
+            : this.bindings.current(spec)
+          if (current !== agent.session.id) return 'Session binding has moved'
           if (this.registry && !spec.internalWorkspace) {
             try {
               const project = resolveBinding(this.registry, spec.owner, spec.workspace)
@@ -276,6 +279,15 @@ export class DshSessionRunner implements SessionRunner {
   private async activate(spec: TurnSpec, tools: AgentTools, signal: AbortSignal): Promise<AgentHandle> {
     const setup = this.setup(spec, tools)
     const workspace = await this.workspaceFor(spec)
+    if (spec.isolatedNotification) {
+      if (spec.layer !== 'L1' || !spec.internalWorkspace || spec.parentBindingId) {
+        throw new Error('外部通知只能使用本机独立的 L1 上下文')
+      }
+      return this.ctx.agents.create({
+        sessionId: SessionId('session-' + randomUUID()), setup, signal,
+        meta: {cwd: workspace.path, origin: 'subagent', agentPreset: 'prism-l1'},
+      })
+    }
     const workspaces = this.ctx.workspaceRegistry
     for (;;) {
       signal.throwIfAborted()

@@ -14,6 +14,7 @@ test('specialist grants and staged assets remain bound to the originating reques
   const documents = []
   const seen = []
   let route
+  let ordinaryBindingId
   const testAsset = {assetId: 'asset-a', mimeType: 'image/png'}
   const memory = {
     workspace: workspaces.memories,
@@ -44,6 +45,10 @@ test('specialist grants and staged assets remain bound to the originating reques
           assert.equal(event.source.sender, 'cron')
           await invoke('send_user', {text: '定时通知', final: true, replyTo: event.replyTo})
         } else if (event.kind === 'external.trigger') {
+          assert.equal(spec.isolatedNotification, true)
+          assert.notEqual(spec.bindingId, ordinaryBindingId)
+          assert.equal(spec.workspaceTitle, undefined)
+          assert.match(spec.systemPrompt, /未经信任/)
           assert.deepEqual(names, ['send_user'])
           assert.equal(event.trust, 'untrusted')
           assert.equal(event.provider, 'msp')
@@ -53,6 +58,7 @@ test('specialist grants and staged assets remain bound to the originating reques
           await assert.rejects(invoke('send_user', {text: '转发', replyTo: 'other'}))
           await invoke('send_user', {text: 'MSP 通知', final: true, replyTo: event.replyTo})
         } else if (event.kind === 'user') {
+          ordinaryBindingId = spec.bindingId
           assert.deepEqual(event.attachments, [testAsset])
           await assert.rejects(invoke('memory_write', {title: 'x', body: 'y'}))
           await invoke('event_add', {providerId: 'cron', params: {expression: '* * * * *'}})
