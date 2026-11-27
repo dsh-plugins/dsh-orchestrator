@@ -16,6 +16,7 @@ export interface Binding {
   privateWorkspace?: true
   specialist?: Specialist
   room?: Room
+  maxDepth?: number
 }
 
 export interface Task extends Binding {

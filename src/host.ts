@@ -15,7 +15,7 @@ import type {} from '@deepseek-ai/dsh-session-title'
 import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native'
 import { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import type { Workspace } from '@deepseek-ai/dsh-workspace/types'
-import { copyVisibleRoot, isWorkspaceHistory, publishWorkspaceHistory, WorkspaceHistories } from './workspace-history.js'
+import { copyVisibleRoot, isWorkspaceHistory, publishWorkspaceHistory, visibleWorkspaceTitle, WorkspaceHistories } from './workspace-history.js'
 import type { AgentTools, RegistryPort, SessionRunner, TraceEntry, TurnSpec } from './contracts.js'
 import { SessionBindings } from './host-bindings.js'
 import { resolveBinding } from './policy.js'
@@ -85,7 +85,7 @@ export class DshSessionRunner implements SessionRunner {
 
   /** 从当前本机网页所有者绑定恢复工作区历史。 */
   async restoreWorkspaceHistory(spec: TurnSpec): Promise<void> {
-    if (!spec.workspaceTitle) {
+    if (!visibleWorkspaceTitle(spec)) {
       return
     }
     const source = this.bindings.current(spec)
@@ -290,7 +290,7 @@ export class DshSessionRunner implements SessionRunner {
       }
       const header = existing === undefined ? undefined : await this.readHeader(existing, signal)
       if (existing !== undefined && header && header.origin === undefined &&
-        spec.layer === 'L1' && spec.workspaceTitle) {
+        spec.layer === 'L1' && visibleWorkspaceTitle(spec)) {
         await this.convertVisibleRoot(spec, workspace, existing, signal)
         continue
       }
@@ -314,8 +314,9 @@ export class DshSessionRunner implements SessionRunner {
         if (existing !== undefined && workspaces.archivedSessionIds.includes(existing)) {
           throw new Error('棱镜会话已归档')
         }
-        if (spec.workspaceTitle) {
-          this.ctx.get('sessionTitle')?.rename(handle.agent.session, spec.workspaceTitle)
+        const title = visibleWorkspaceTitle(spec)
+        if (title) {
+          this.ctx.get('sessionTitle')?.rename(handle.agent.session, title)
         }
         // Materialize even an empty session before publishing its logical identifier.
         await this.ctx.sessions.flush(handle.agent.session)

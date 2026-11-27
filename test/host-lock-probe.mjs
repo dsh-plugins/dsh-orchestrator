@@ -220,6 +220,10 @@ export function apply(ctx, config) {
       const imId = await run({ ...session('private-im'), owner: 'im:fixture', workspaceTitle: '棱镜' }, '私聊内容')
       assert.equal((await ctx.sessionPersistence.stat(imId)).header.origin, 'subagent')
       assert.equal(workspace.sessionIds.filter(isWorkspaceHistory).length, 1)
+      const sharedIm = await run({...session('shared-im'), owner: 'im:fixture', workspaceTitle: '共享会话',
+        showWorkspaceHistory: true}, '共享入口内容')
+      assert.equal((await ctx.sessionPersistence.stat(sharedIm)).header.origin, 'subagent')
+      assert.equal(workspace.sessionIds.filter(isWorkspaceHistory).length, 2)
       await host.close()
       const released = await ctx.sessionPersistence.open(restored.id, 'write')
       await released.close()

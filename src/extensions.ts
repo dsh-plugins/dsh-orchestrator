@@ -40,9 +40,9 @@ export interface TriggerEvent {
 export interface PrismTriggers {
   readonly workspace: string
   setSink(sink: (event: TriggerEvent) => Promise<unknown>): () => void
-  add(input: {providerId: string; params: unknown}, route: ReplyRoute): Promise<unknown>
-  remove(id: string, route: ReplyRoute): Promise<boolean>
-  publish(input: {providerId: string; source: string}): Promise<unknown>
+  add(input: {providerId: string; params: unknown}, route: ReplyRoute, authorize?: () => void): Promise<unknown>
+  remove(id: string, route: ReplyRoute, authorize?: () => void): Promise<boolean>
+  publish(input: {providerId: string; source: string}, authorize?: () => void): Promise<unknown>
 }
 
 export interface PrismExtensions {
@@ -91,8 +91,8 @@ const eventPublish = tool('event_provider_publish', '编译、验证并挂载 Ty
 const triggerTools = [
   eventSpawn,
   tool('event_add', '订阅事件 Provider。cron 参数为 expression、可选 timezone 和 payload。', {
-    providerId: string, params: {type: 'object', additionalProperties: true},
-  }),
+    providerId: string, params: {description: '由 Provider 定义的 JSON 参数，可省略。'},
+  }, ['providerId']),
   tool('event_remove', '移除当前渠道身份创建的事件订阅。', {id: string}),
 ]
 

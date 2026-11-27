@@ -107,15 +107,20 @@ export async function copyVisibleRoot(
   await workspace.attachSession(hidden)
 }
 
+export function visibleWorkspaceTitle(spec: TurnSpec): string | undefined {
+  return spec.owner === 'web:owner' || spec.showWorkspaceHistory ? spec.workspaceTitle : undefined
+}
+
 /** 将已结算的正式会话记录追加到同一个原生工作区会话。 */
 export async function publishWorkspaceHistory(
   ctx: Context, histories: WorkspaceHistories, spec: TurnSpec, workspace: Workspace, source: Id,
   signal: AbortSignal, legacy?: Id,
 ): Promise<void> {
-  if (!spec.workspaceTitle || spec.owner !== 'web:owner') {
+  const label = visibleWorkspaceTitle(spec)
+  if (!label) {
     return
   }
-  const title = normalizeSessionTitle(spec.workspaceTitle, 256)
+  const title = normalizeSessionTitle(label, 256)
   if (!title) {
     throw new Error('棱镜工作区历史标题无效')
   }

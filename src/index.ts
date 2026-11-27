@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { mkdir, realpath } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
-import { isAbsolute, join, relative, sep } from 'node:path'
+import { isAbsolute, join, relative, resolve as absolute, sep } from 'node:path'
 import { dshPath } from '@deepseek-ai/dsh-home-paths'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type {} from '@dsh-prism/dsh-workspace-registry'
@@ -40,18 +40,22 @@ declare module '@deepseek-ai/cordis' {
   interface Context { prism: Orchestrator }
 }
 
-function publicRegistry(registry: RegistryPort, privateRoot: string, nodeId: string): RegistryPort {
+function publicRegistry(registry: RegistryPort, privateRoots: string[], nodeId: string): RegistryPort {
+  const contains = (parent: string, child: string) => {
+    const offset = relative(parent, child)
+    return !offset || (!isAbsolute(offset) && offset !== '..' && !offset.startsWith('..' + sep))
+  }
+  const canonical = (path: string): string => {
+    try { return realpathSync(path) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { throw error }
+      return absolute(path)
+    }
+  }
   const resolve: RegistryPort['resolve'] = (owner, projectId, mode) => {
     const project = registry.resolve(owner, projectId, mode)
     if (project.nodeId === nodeId) {
-      let path = project.workspace
-      try { path = realpathSync(path) } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw error
-        }
-      }
-      const offset = relative(privateRoot, path)
-      if (!offset || (!isAbsolute(offset) && offset !== '..' && !offset.startsWith('..' + sep))) {
+      const path = canonical(project.workspace)
+      if (privateRoots.map(canonical).some(root => contains(root, path) || contains(path, root))) {
         throw new Error('此工作区为棱镜内部使用')
       }
     }
@@ -78,7 +82,8 @@ export async function apply(ctx: Context, config: Config) {
       throw new Error('棱镜私有工作区路径已重定向')
     }
   }
-  const registry = privateRoot ? publicRegistry(ctx.prismRegistry, privateRoot, mesh.nodeId) : ctx.prismRegistry
+  const registry = profileData ? publicRegistry(ctx.prismRegistry, [...new Set([profileData, directory])], mesh.nodeId)
+    : ctx.prismRegistry
   const local = new DshSessionRunner(ctx, directory, registry)
   ctx.on('agent/created', ({agent}) => local.guardHistoryAgent(agent), { prepend: true })
   for (const id of [mesh.nodeId, ...mesh.nodeIds]) {

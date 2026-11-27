@@ -76,6 +76,8 @@ export interface TurnSpec {
   room?: Room
   /** 本机网页所有者的原生工作区会话标题。此字段不经过 Mesh。 */
   workspaceTitle?: string
+  /** 由当前节点复核后授予的 DSH 所有者历史投影。 */
+  showWorkspaceHistory?: true
   /** 仅由本机编排器标记的私有工作区。 */
   internalWorkspace?: boolean
   model: ModelConfig

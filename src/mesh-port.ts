@@ -46,7 +46,7 @@ export const batchSpawn = tool('agent_spawn',
       permissions: {type: 'array', items: string},
     },
     required: ['nodeId', 'projectId', 'modelId', 'title', 'instruction'], additionalProperties: false,
-  }}, room: {type: 'boolean'}}, ['agents'])
+  }}, room: {type: 'boolean'}, max_depth: {type: 'integer', minimum: 1, maximum: 2}}, ['agents'])
 
 export const peerSend = tool('peer_send', '将消息发送给同一个 Room 中当前可用的 L2 成员。',
   {target_node: string, target_agent_id: string, text: string})

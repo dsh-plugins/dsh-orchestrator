@@ -44,7 +44,7 @@ test('Room receipts admit only live addressed L2 members and deduplicate replay 
     workers.set(nodeId, new Orchestrator({models}, {}, {}, join(dir, nodeId),
       undefined, undefined, {workspace: {nodeId, projectId: 'prism-conversation', cwd: dir}, mesh: mesh(nodeId)}))
   }
-  core = new Orchestrator({models, maxDepth: 1}, {query: () => []}, {
+  core = new Orchestrator({models, maxDepth: 2}, {query: () => []}, {
     async run(spec, raw, tools) {
       const event = JSON.parse(raw)
       const {invoke} = tools
@@ -53,7 +53,7 @@ test('Room receipts admit only live addressed L2 members and deduplicate replay 
           const visible = await invoke('query_projects', {})
           assert.equal(visible.length, 2)
           assert.ok(visible.every(project => !Object.hasOwn(project, 'workspace')))
-          await invoke('agent_spawn', {room: true, agents: visible.map(project => ({
+          await invoke('agent_spawn', {room: true, max_depth: 1, agents: visible.map(project => ({
             nodeId: project.nodeId, projectId: project.id, modelId: 'plan', title: '检查', instruction: '调查',
           }))})
         } else if (spec.layer === 'L2' && event.kind === 'assignment') {

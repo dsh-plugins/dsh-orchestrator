@@ -559,7 +559,7 @@ export class Orchestrator {
       owner: spec.owner, bindingId: spec.bindingId, parentBindingId: spec.parentBindingId, layer: spec.layer,
       depth, maxDepth, ...(spec.room && {room: spec.room}),
       model: {...model}, systemPrompt: systemPrompt(spec.layer, model), allowedTools,
-      ...(this.profile && {workspaceTitle: '棱镜 ' + spec.layer}),
+      ...(this.profile && {workspaceTitle: '棱镜 ' + spec.layer, showWorkspaceHistory: true}),
       ...(spec.layer === 'L2' && {delegationCeiling: narrow(this.ceiling(project), spec.delegationCeiling ?? [])}),
       workspace: {projectId: project.id, nodeId: project.nodeId, cwd: project.workspace},
     }
@@ -583,8 +583,10 @@ export class Orchestrator {
     return {
       owner: actor.layer === 'L1' && actor.privateWorkspace ? webOwner : owner,
       bindingId: actor.id, parentBindingId, layer: actor.layer, model: {...model}, workspace: {...actor.target},
-      depth: depths[actor.layer], maxDepth: this.maxDepth, ...(actor.room && {room: actor.room}),
+      depth: depths[actor.layer], maxDepth: Math.min(this.maxDepth, actor.maxDepth ?? this.maxDepth),
+      ...(actor.room && {room: actor.room}),
       ...(actor.privateWorkspace && {internalWorkspace: true}),
+      ...(this.profile && {showWorkspaceHistory: true}),
       ...((owner === webOwner || this.profile) && {
         workspaceTitle: actor.layer === 'L1' ? '棱镜' : '棱镜 ' + actor.layer + ('title' in actor ? ' · ' + actor.title : ''),
       }),
@@ -644,7 +646,7 @@ export class Orchestrator {
         !!extensions?.triggers(), origin?.source.channel === 'trigger' ? false : !!origin)
       const normalTools = toolSets[actor.layer].filter(tool => {
         if (actor.specialist) { return tool.name === 'send_parent' || tool.name === 'report_progress' }
-        return tool.name !== 'dispatch_executor' || this.maxDepth >= 2
+        return tool.name !== 'dispatch_executor' || spec.maxDepth! >= 2
       })
       if (actor.layer === 'L1' && this.profile?.mesh) { normalTools.push(batchSpawn) }
       if (actor.layer === 'L2' && actor.room) { normalTools.push(peerSend) }
@@ -665,7 +667,9 @@ export class Orchestrator {
           if (!actor.privateWorkspace) { await this.currentProject(principal, actor.target) }
           if (name === 'query_projects') {
             const search = values.search === '' || values.search === undefined ? undefined : textField(values.search, 1024)
-            return (await this.projectIndex(principal, search)).map(({id, description, stack, nodeId, gitRemote, permissions}) => ({
+            const projects = await this.projectIndex(principal, search)
+            live()
+            return projects.map(({id, description, stack, nodeId, gitRemote, permissions}) => ({
               id, description, stack, nodeId, permissions, ...(gitRemote === undefined ? {} : {gitRemote}),
             }))
           }
@@ -693,7 +697,7 @@ export class Orchestrator {
               if (!reply || reply.delivered) return {sent: true}
             }
             if (assignments) {
-              return this.spawnBatch(principal, state, actor, job, assignments, values.room === true)
+              return this.spawnBatch(principal, state, actor, job, assignments, values.room === true, values.max_depth)
             }
             return this.invoke(principal, state, actor.id, name, values, job, destination)
           })
@@ -702,7 +706,8 @@ export class Orchestrator {
           return result
         },
       }
-      const input = job.deliveryOnly ? await this.finalizationText(owner, job) : this.eventText(job, this.store.read(owner)!)
+      const input = job.deliveryOnly ? await this.finalizationText(owner, job)
+        : await this.inboxText(job, this.store.read(owner)!, principal)
       await this.runner.run(spec, input, tools)
       succeeded = true
     } catch (error) {
@@ -776,6 +781,23 @@ export class Orchestrator {
       eventId: job.id, requestId: job.originId, source: origin.source, replyTo: origin.replyTo, ...event,
       ...(room && {room: {id: room.id, members: room.members}}),
     } : event)
+  }
+
+  private async inboxText(job: Job, state: Conversation, principal: string): Promise<string> {
+    const event = JSON.parse(job.text) as Record<string, unknown>
+    if (event.kind === 'task_settled' || event.kind === 'child_message') {
+      const completed = state.tasks.find(task => task.id === event.taskId)
+      if (completed && !completed.privateWorkspace) {
+        try {
+          await this.currentProject(principal, completed.target)
+        } catch {
+          const safe = {kind: 'task_settled', taskId: completed.id, status: 'failed',
+            result: '项目已不可访问，无法提供任务结果。'}
+          return this.eventText(job, state, safe)
+        }
+      }
+    }
+    return this.eventText(job, state, event)
   }
 
   private settleTask(state: Conversation, task: Task, ok: boolean, originId?: string): void {
@@ -919,10 +941,12 @@ export class Orchestrator {
       return memory.write(input, key, authorize)
     }
     if (triggers && origin.source.channel !== 'trigger') {
-      if (name === 'event_add') { return triggers.add({providerId: textField(args.providerId, 128), params: args.params}, origin) }
-      if (name === 'event_remove') { return {removed: await triggers.remove(textField(args.id, 128), origin)} }
+      if (name === 'event_add') {
+        return triggers.add({providerId: textField(args.providerId, 128), params: args.params}, origin, authorize)
+      }
+      if (name === 'event_remove') { return {removed: await triggers.remove(textField(args.id, 128), origin, authorize)} }
       if (name === 'event_provider_publish' && actor.specialist === 'event') {
-        return triggers.publish({providerId: textField(args.providerId, 128), source: textField(args.source, 128 * 1024)})
+        return triggers.publish({providerId: textField(args.providerId, 128), source: textField(args.source, 128 * 1024)}, authorize)
       }
     }
     throw new Error('本轮工具权限已失效')
@@ -933,9 +957,10 @@ export class Orchestrator {
   }
 
   private dispatch(owner: string, state: Conversation, actor: Binding, args: Record<string, unknown>,
-    originId?: string, specialist?: Specialist, remote?: ProjectMetadata): {taskId: string} {
+    originId?: string, specialist?: Specialist, remote?: ProjectMetadata, requestedDepth?: number): {taskId: string} {
     const layer = actor.layer === 'L1' ? 'L2' : 'L3'
-    if (depths[layer] > this.maxDepth) { throw new Error('派发层级超过 maxDepth') }
+    const maxDepth = Math.min(this.maxDepth, actor.maxDepth ?? this.maxDepth, requestedDepth ?? this.maxDepth)
+    if (depths[layer] > maxDepth) { throw new Error('派发层级超过 max_depth') }
     const model = modelFor(this.currentConfig(), layer, textField(args.modelId, 256))
     const projectId = specialist ? 'prism-' + specialist
       : layer === 'L2' ? textField(args.projectId, 1024) : actor.target.projectId
@@ -951,7 +976,7 @@ export class Orchestrator {
     }
     const ceiling = project ? this.ceiling(project).filter(name => layer === 'L2' || actor.ceiling.includes(name)) : []
     const task: Task = {
-      id: randomUUID(), layer, target, modelId: model.id, ceiling: narrow(ceiling, args.permissions),
+      id: randomUUID(), layer, target, modelId: model.id, ceiling: narrow(ceiling, args.permissions), maxDepth,
       ...(this.config.useHostModel && {hostModel: model}),
       ...(specialist && {privateWorkspace: true, specialist}),
       parent: actor.id, title: textField(args.title, 240), progress: '', at: now(), status: 'queued', originId,
@@ -984,9 +1009,13 @@ export class Orchestrator {
   }
 
   private spawnBatch(owner: string, state: Conversation, actor: Binding, job: Job,
-    assignments: Awaited<ReturnType<Orchestrator['prepareBatch']>>, share: boolean) {
+    assignments: Awaited<ReturnType<Orchestrator['prepareBatch']>>, share: boolean, requestedDepth: unknown) {
     const mesh = this.profile!.mesh!
-    const assignmentsById = assignments.map(({args, project}) => this.dispatch(owner, state, actor, args, job.originId, undefined, project))
+    if (requestedDepth !== undefined && ((requestedDepth !== 1 && requestedDepth !== 2) || requestedDepth > this.maxDepth)) {
+      throw new Error('max_depth 超出当前配置允许的派发深度')
+    }
+    const assignmentsById = assignments.map(({args, project}) =>
+      this.dispatch(owner, state, actor, args, job.originId, undefined, project, requestedDepth))
     const tasks = assignmentsById.map(({taskId}) => state.tasks.find(task => task.id === taskId)!)
     if (!share) { return {tasks: assignmentsById} }
     const room = {id: randomUUID(), coordinatorNode: mesh.nodeId,
@@ -1045,7 +1074,8 @@ export class Orchestrator {
       !mesh.verify(sourceNodeId, peerPayload(message, targetNodeId), message.proof)) {
       throw new Error('Room 消息发送者或目标无效')
     }
-    const receipt = JSON.stringify([room.id, sourceNodeId, senderAgentId, textField(message.messageId, 128)])
+    const receipt = JSON.stringify([room.id, sourceNodeId, senderAgentId, targetNodeId, targetAgentId,
+      textField(message.messageId, 128)])
     const activeMembers = (state: Conversation) => {
       const sender = state.tasks.find(task => task.id === senderAgentId && task.target.nodeId === sourceNodeId)
       const target = state.tasks.find(task => task.id === targetAgentId && task.target.nodeId === targetNodeId)
