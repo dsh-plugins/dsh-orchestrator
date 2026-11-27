@@ -192,10 +192,7 @@ export class DshSessionRunner implements SessionRunner {
     return this.ctx.agents.create({
       ...options, seed, inheritedEventCount: SessionLogOffset(count),
       parentSource: { sessionId: source, endSeq: SessionLogOffset(count) },
-      meta: {
-        ...options.meta, isSeeded: true,
-        ...(options.meta?.origin === 'subagent' && { parentSession: source }),
-      },
+      meta: { ...options.meta, isSeeded: true },
     })
   }
 
@@ -221,10 +218,14 @@ export class DshSessionRunner implements SessionRunner {
       signal.throwIfAborted()
       await this.archive(spec.bindingId)
       const existing = this.bindings.current(spec)
-      const legacy = visible && existing !== undefined &&
-        (this.ctx.sessions.get(existing)?.header ?? (await this.ctx.sessionPersistence.stat(existing, { signal }))?.header)
-          ?.origin === 'subagent'
-      if (existing !== undefined && !legacy) {
+      const header = existing === undefined ? undefined
+        : this.ctx.sessions.get(existing)?.header ?? (await this.ctx.sessionPersistence.stat(existing, { signal }))?.header
+      const legacy = visible && header?.origin === 'subagent'
+      const previousParent = header?.parentSession
+      const retiredParent = existing !== undefined && !workspaces.archivedSessionIds.includes(existing) &&
+        previousParent !== undefined && previousParent !== parentSession &&
+        workspaces.archivedSessionIds.includes(previousParent)
+      if (existing !== undefined && !legacy && !retiredParent) {
         try {
           return await this.ctx.agents.resume({ resumeSessionId: existing, setup, signal })
         } catch (error) {

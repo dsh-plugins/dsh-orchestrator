@@ -66,7 +66,8 @@ export class SessionBindings {
       }
       this.db.prepare(`INSERT INTO bindings VALUES (?, ?, ?)
         ON CONFLICT(binding) DO UPDATE SET session = excluded.session`).run(spec.bindingId, this.scope(spec), next)
-      if (expected !== undefined) this.queueArchive(spec.bindingId, expected)
+      // L1 和 L2 的旧会话仍可能是其他任务的父会话，归档会阻止这些任务继续运行。
+      if (expected !== undefined && spec.layer === 'L3') this.queueArchive(spec.bindingId, expected)
       this.db.exec('COMMIT')
       return true
     } catch (error) {

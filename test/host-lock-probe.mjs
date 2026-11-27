@@ -35,7 +35,7 @@ export function apply(ctx, config) {
             assert.equal(agent.session.header.cwd, config.directory)
             assert.equal(agent.model.current()?.model, spec.model.id)
             if (previous) {
-              assert.equal(agent.session.header.parentSession, previous)
+              assert.equal(agent.session.header.parentSession, ids.at(-1))
               assert.ok(agent.session.header.isSeeded)
               assert.ok(agent.session.snapshotEvents().some(e => e.type === 'session/end-seed'))
             }
@@ -57,7 +57,7 @@ export function apply(ctx, config) {
           }
           const forked = await activate(original)
           assert.notEqual(original, forked)
-          assert.ok(ctx.workspaceRegistry.archivedSessionIds.includes(SessionId(original)))
+          assert.equal(ctx.workspaceRegistry.archivedSessionIds.includes(SessionId(original)), layer === 'L3')
           assert.equal(await activate(), forked)
           ids.push(forked)
         } finally {
@@ -93,7 +93,7 @@ export function apply(ctx, config) {
       const restored = workspace.getSessionHeaders().find(header => header.origin === undefined)
       assert.ok(restored)
       assert.notEqual(restored.id, oldId)
-      assert.ok(ctx.workspaceRegistry.archivedSessionIds.includes(oldId))
+      assert.ok(!ctx.workspaceRegistry.archivedSessionIds.includes(oldId))
       assert.equal((await ctx.sessionQuery.readTitle(restored.id)).title, '棱镜')
       assert.ok((await host.transcript(visibleSpec)).some(entry => entry.text.includes('原始会话内容')))
       await host.restoreOwnerSession(visibleSpec)
@@ -103,6 +103,26 @@ export function apply(ctx, config) {
       assert.ok(workspace.sessionIds.includes(freshId))
       assert.equal((await ctx.sessionPersistence.stat(freshId)).header.origin, undefined)
       assert.equal((await ctx.sessionQuery.readTitle(freshId)).title, '棱镜')
+
+      const planner = { ...session('planner'), layer: 'L2', parentBindingId: 'new-owner' }
+      const plannerId = await run(planner, '已取得执行步骤的结果')
+      const lock = await ctx.sessionPersistence.open(freshId, 'write')
+      let replacement
+      try {
+        replacement = await run({ ...session('new-owner'), workspaceVisible: true }, '继续与棱镜对话')
+        assert.notEqual(replacement, freshId)
+        assert.ok(!ctx.workspaceRegistry.archivedSessionIds.includes(freshId))
+      } finally {
+        await lock.close()
+      }
+      assert.equal(await run(planner, '旧父会话仍存在，继续整理结果'), plannerId)
+      await ctx.workspaceRegistry.archiveSession(freshId, { stopActivity: true })
+      const repaired = await run(planner, '从旧版已归档的父会话恢复汇总')
+      assert.notEqual(repaired, plannerId)
+      assert.equal((await ctx.sessionPersistence.stat(repaired)).header.parentSession, replacement)
+      assert.ok((await host.transcript(planner)).some(entry => entry.text.includes('已取得执行步骤的结果')))
+      assert.equal(await run(planner, '下一轮继续沿用会话'), repaired)
+
       const imId = await run({ ...session('private-im'), owner: 'im:fixture', workspaceVisible: true }, '私聊内容')
       assert.equal((await ctx.sessionPersistence.stat(imId)).header.origin, 'subagent')
       process.stdout.write('PRISM_LOCK_OK\n')
