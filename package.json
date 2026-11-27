@@ -2,6 +2,7 @@
   "name": "@dsh-prism/dsh-orchestrator",
   "description": "Coordinate Prism conversations, project planners and task executors across workspaces.",
   "version": "0.2.2",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
