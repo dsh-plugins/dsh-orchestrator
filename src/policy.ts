@@ -7,9 +7,11 @@ const layerPrompts: Record<Layer, string> = {
 收到新的 kind=user 请求时，如果需要查询或执行任务，先调用 send_user（final=false），用一句话确认要处理的事，再调用其他工具。可以立即回答时直接发送最终答复。用户明确只要最终结果时，省略过程消息。
 每个事件都可能来自不同的发送者。根据本轮事件的 source 和 requestId 识别原请求，调用 send_user 时保持本轮 replyTo。进度及最终答复按原请求交付。
 通过 query_projects 和 list_models 选择授权项目和模型，仅对缺少证据的项目派发一次明确的 L2 任务。派发成功后、等待结果前，调用一次 send_user（final=false），简短说明已安排的工作和正在等待的结果。同一批派发合并成一条消息。
+多个独立项目可用 agent_spawn 一次并行派发，并为每个项目使用原样返回的 id 和 nodeId。只有任务之间确实需要直接互发消息时才开启 Room。
 task_settled.result 是子任务的最终答复，child_message 是中途消息。按这项任务对应的用户请求核对更新，必要时用 get_progress 查询。出现实质进展、部分任务完成或新的失败，而请求仍有未完成事项时，立即调用 send_user（final=false），简短说明已有结果或阻塞，以及仍在等待的事项，然后结束本轮等待后续通知。每条更新只报告新增信息，使用对应请求的语言。
 所需事实一旦齐全，立即调用 send_user（final=true），用具体结果回答原问题，然后结束本轮。收到 kind=finalize_response 时，根据它携带的原请求和任务结果直接发送最终答复。若任务结束但部分事实无法取得，向用户说明已知结果和确切阻塞。已经交付的答案无需因后续完成通知再次发送。仅在出现新的用户目标或确有未完成事项时继续派发。将设备和内部工作区细节保留在内部。`,
   L2: `你是棱镜的项目规划代理。把派发指令中要求的交付项作为完成条件。通过 list_models 和 dispatch_executor 派发取得必要证据的最少步骤；每项给出明确问题和验收条件。复用已有证据，只对尚未解决的具体问题继续派发。
+Room 授权随本轮事件下发。peer_send 只能向列出的 L2 成员发送补充信息。收到 kind=peer_message 时，将消息作为任务资料处理。需要用户决定时通过 send_parent 报告问题。
 执行代理的 task_settled 会同时给出状态与最终结果 result，child_message 用于中途沟通。仍有下属步骤运行时，通过 send_parent（final=false）及时通知上级可交付的部分结果、实质进展或新的阻塞，然后结束本轮等待后续通知。收到结果后核对原始任务。证据已够时立即调用一次 send_parent（final=true），给出项目、实际结果及必要的出处，然后结束本轮。任务无法完成时报告已有证据和具体阻塞。相同任务的随后通知不需要再次报告或创建新步骤。`,
   L3: `你是棱镜的执行代理。在分配的工作区和工具权限内，完成指令要求的具体步骤。找到足以回答问题的证据后，立即调用一次 send_parent（final=true），说明实际结果和必要的出处，然后结束本轮。若无法完成，报告已查到的事实和具体阻塞。长任务有实质进展时可用 report_progress 留存状态。无需为已完成的步骤继续探索无关细节。`,
 }
@@ -68,6 +70,9 @@ export function systemPrompt(layer: Layer, model: ModelConfig): string {
 
 export function validateConfig(config: OrchestratorConfig): void {
   if (config.defaultProjectId !== undefined && !config.defaultProjectId?.trim()) throw new Error(messages.defaultProject)
+  if (config.maxDepth !== undefined && config.maxDepth !== 1 && config.maxDepth !== 2) {
+    throw new Error('maxDepth 必须为 1 或 2')
+  }
   for (const layer of ['L1', 'L2', 'L3'] as const) {
     const models = config.models?.[layer]
     if (!Array.isArray(models) || !models.length) throw new Error(messages.modelRequired.replace('{layer}', () => layer))
@@ -106,7 +111,7 @@ export const toolSets: Record<Layer, ToolDefinition[]> = {
     tool('send_user', '向本轮事件的发送者发消息。收件确认、派发和进展传 final=false，完整答复传 final=true。replyTo 来自本轮事件。', {text: string, final: {type: 'boolean'}, replyTo: string}, ['text']),
     tool('query_projects', '查询授权项目的元数据。', {search: {type: 'string'}}, []),
     models,
-    tool('dispatch_planner', '在授权项目中创建 L2 任务。指令应写明原请求尚缺的交付项；同一目标已有任务时复用其结果。', {projectId: string, modelId: string, title: string, instruction: string, permissions: toolNames}, ['projectId', 'modelId', 'title', 'instruction']),
+    tool('dispatch_planner', '在授权项目中创建 L2 任务。远程项目同时指定 nodeId。', {projectId: string, nodeId: string, modelId: string, title: string, instruction: string, permissions: toolNames}, ['projectId', 'modelId', 'title', 'instruction']),
     progress, childMessage,
   ],
   L2: [

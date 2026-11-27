@@ -1,4 +1,5 @@
 import type {MediaAsset} from './extensions.js'
+import type {Room} from './mesh-port.js'
 
 export type Layer = 'L1' | 'L2' | 'L3'
 
@@ -26,6 +27,7 @@ export interface ModelConfig {
 interface ProjectPolicy {
   defaultProjectId?: string
   executionTools?: string[]
+  maxDepth?: number
 }
 
 export interface HostModelConfig extends ProjectPolicy {
@@ -60,6 +62,8 @@ export interface WorkspaceTarget {
   projectId: string
   nodeId: string
   cwd: string
+  /** 远程只接收元数据，实际路径由该节点复核。 */
+  discovered?: true
 }
 
 export interface TurnSpec {
@@ -67,6 +71,9 @@ export interface TurnSpec {
   owner: string
   parentBindingId?: string
   layer: Layer
+  depth?: number
+  maxDepth?: number
+  room?: Room
   /** 本机网页所有者的原生工作区会话标题。此字段不经过 Mesh。 */
   workspaceTitle?: string
   /** 仅由本机编排器标记的私有工作区。 */

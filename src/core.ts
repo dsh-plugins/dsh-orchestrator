@@ -7,6 +7,8 @@ import {modelFor, nativeExecutionTools, permittedModels, remoteModelFor, resolve
 import {ConversationStore, enqueue, type Binding, type Conversation, type Job, type Task} from './store.js'
 import {extensionTools, memoryQueries, toolArguments, type MediaAsset, type MediaUpload,
   type PrismExtensions, type Specialist, type TriggerEvent} from './extensions.js'
+import {batchSpawn, hasMember, peerPayload, peerSend, roomPayload, type MeshPort, type PeerInboxMessage,
+  type PeerMessage, type Room} from './mesh-port.js'
 
 export type * from './contracts.js'
 
@@ -45,11 +47,13 @@ function terminal(task: Task): boolean { return task.status === 'completed' || t
 
 const sharedConversation = 'profile:shared'
 const webOwner = 'web:owner'
+const depths = {L1: 0, L2: 1, L3: 2}
 
 /** 私有工作区与渠道的生命周期由 Cordis 宿主提供。 */
 export interface ProfileConversation {
   workspace: WorkspaceTarget
   extensions?: PrismExtensions
+  mesh?: MeshPort
 }
 
 export class Orchestrator {
@@ -86,6 +90,7 @@ export class Orchestrator {
       model.provider === fallback.provider && (model.model ?? model.id) === (fallback.model ?? fallback.id))
     return {
       defaultProjectId: this.config.defaultProjectId, executionTools: this.config.executionTools,
+      maxDepth: this.config.maxDepth,
       models, defaultL1Model: preferred?.id,
     }
   }
@@ -286,22 +291,28 @@ export class Orchestrator {
     const eventId = requestId && this.profile
       ? createHash('sha256').update(JSON.stringify([owner, requestId])).digest('base64url')
       : requestId
+    const route = this.profile ? this.route(owner) : undefined
+    const sender = this.profile ? (source ?? {channel: owner === webOwner ? 'web' : 'im'}) : undefined
+    const current = attachmentIds.length ? this.store.read(conversation) : undefined
+    if (current && eventId && current.requests.includes(eventId)) { return this.snapshot(current, owner) }
+    const staged = route && current?.stagedMedia?.[route.replyTo]
+    const attachments = [...new Set(attachmentIds)].map(id => {
+      const key = textField(id, 128)
+      if (!staged || !Object.hasOwn(staged, key)) {
+        throw new PrismError('INVALID_INPUT', '附件不属于当前发送方')
+      }
+      return staged[key]
+    })
+    if (attachments.length) {
+      await this.profile?.extensions?.memory()?.pinMedia?.(attachments.map(asset => asset.assetId))
+      if (this.stopping || !this.permits(owner)) { throw new Error('本轮发送权限已失效') }
+    }
     const result = this.change(conversation, state => {
       if (eventId && state.requests.includes(eventId)) return this.snapshot(state, owner)
       this.refreshRoot(owner, state)
       if (eventId) state.requests.push(eventId)
       const messageId = randomUUID()
       const at = now()
-      const route = this.profile ? this.route(owner) : undefined
-      const sender = this.profile ? (source ?? {channel: owner === webOwner ? 'web' : 'im'}) : undefined
-      const staged = route && state.stagedMedia?.[route.replyTo]
-      const attachments = [...new Set(attachmentIds)].map(id => {
-        const asset = staged?.[textField(id, 128)]
-        if (!asset || !Object.hasOwn(staged!, id)) {
-          throw new PrismError('INVALID_INPUT', '附件不属于当前发送方')
-        }
-        return asset
-      })
       if (route && sender) {
         const origins = state.origins ??= {}
         origins[messageId] = {...route, source: sender}
@@ -428,6 +439,10 @@ export class Orchestrator {
     if (!task || !principal || (principal !== owner && owner !== webOwner) || !this.permits(owner)) {
       throw new PrismError('NOT_FOUND', '找不到此任务')
     }
+    if (this.profile?.mesh && task.target.nodeId !== this.profile.mesh.nodeId) {
+      await this.currentProject(principal, task.target)
+      return [{role: 'system', text: '请在执行节点 ' + task.target.nodeId + ' 的 DSH 工作区查看会话历史。'}]
+    }
     return this.runner.transcript(this.spec(principal, task, task.modelId, task.parent))
   }
 
@@ -462,11 +477,76 @@ export class Orchestrator {
     return (this.config.executionTools ?? nativeExecutionTools).filter(name => nativeExecutionTools.includes(name) && project.permissions.includes(name))
   }
 
+  private get maxDepth(): number {
+    return this.config.maxDepth ?? 2
+  }
+
+  private async projectIndex(owner: string, search?: string): Promise<ProjectMetadata[]> {
+    const projects = this.registry.query(owner, search)
+    const mesh = this.profile?.mesh
+    if (!mesh) { return projects }
+    const remote = await Promise.allSettled(mesh.nodeIds.map(node =>
+      mesh.queryProjects(node, owner, search, AbortSignal.timeout(3500))))
+    const indexed = new Map(projects.filter(project => project.nodeId === mesh.nodeId)
+      .map(project => [JSON.stringify([project.nodeId, project.id]), project]))
+    for (const result of remote) {
+      if (result.status === 'fulfilled') {
+        for (const project of result.value) {
+          indexed.set(JSON.stringify([project.nodeId, project.id]), project)
+        }
+      }
+    }
+    return [...indexed.values()]
+  }
+
+  private async remoteProject(owner: string, nodeId: string, projectId: string): Promise<ProjectMetadata> {
+    const mesh = this.profile?.mesh
+    if (!mesh || !mesh.nodeIds.includes(nodeId)) {
+      throw new Error('远程项目所在节点未配置')
+    }
+    const projects = await mesh.queryProjects(nodeId, owner, projectId, AbortSignal.timeout(8000))
+    const project = projects.find(item => item.nodeId === nodeId && item.id === projectId)
+    if (!project) { throw new Error('远程项目未导出或无权访问') }
+    return project
+  }
+
+  private currentProject(owner: string, target: WorkspaceTarget): Promise<ProjectMetadata> | ProjectMetadata {
+    return target.discovered ? this.remoteProject(owner, target.nodeId, target.projectId)
+      : resolveBinding(this.registry, owner, target)
+  }
+
+  private async dispatchProject(owner: string, args: Record<string, unknown>): Promise<ProjectMetadata | undefined> {
+    const mesh = this.profile?.mesh
+    if (!mesh || args.nodeId === undefined || args.nodeId === mesh.nodeId) { return undefined }
+    return this.remoteProject(owner, textField(args.nodeId, 128), textField(args.projectId, 1024))
+  }
+
+  /** 只将工作节点显式导出的项目交给 Mesh 做对端 ACL 过滤。 */
+  exportProjects(owner: string, search?: string): ProjectMetadata[] {
+    const nodeId = this.profile?.workspace.nodeId
+    return this.registry.query(owner, search).filter(project => {
+      try { return this.registry.resolve(owner, project.id, 'configured').nodeId === nodeId } catch { return false }
+    })
+  }
+
   /** At the mesh boundary reconstruct all security-sensitive fields from worker-local configuration. */
   authorizeRemote(spec: TurnSpec): TurnSpec {
     textField(spec.owner, 2048)
     textField(spec.bindingId, 256)
     if (!['L1', 'L2', 'L3'].includes(spec.layer)) throw new Error('未知代理层级')
+    const depth = depths[spec.layer]
+    const granted = spec.maxDepth ?? this.maxDepth
+    const maxDepth = Math.min(this.maxDepth, granted)
+    if ((granted !== 1 && granted !== 2) || (spec.depth !== undefined && spec.depth !== depth) ||
+      depth > maxDepth || (this.profile && spec.layer === 'L1')) {
+      throw new Error('此节点的派发层级超过限制')
+    }
+    if (spec.room) {
+      this.verifyRoom(spec.room)
+      if (spec.layer !== 'L2' || !hasMember(spec.room, spec.workspace.nodeId, spec.bindingId)) {
+        throw new Error('当前代理无权加入 Room')
+      }
+    }
     if (spec.layer === 'L1') {
       if (spec.parentBindingId !== undefined || (this.config.defaultProjectId !== undefined && spec.workspace.projectId !== this.config.defaultProjectId)) throw new Error('交互会话必须绑定默认项目')
     } else { textField(spec.parentBindingId, 256) }
@@ -477,15 +557,18 @@ export class Orchestrator {
     const allowedTools = narrow(spec.layer === 'L3' ? this.ceiling(project) : [], spec.allowedTools)
     return {
       owner: spec.owner, bindingId: spec.bindingId, parentBindingId: spec.parentBindingId, layer: spec.layer,
+      depth, maxDepth, ...(spec.room && {room: spec.room}),
       model: {...model}, systemPrompt: systemPrompt(spec.layer, model), allowedTools,
+      ...(this.profile && {workspaceTitle: '棱镜 ' + spec.layer}),
       ...(spec.layer === 'L2' && {delegationCeiling: narrow(this.ceiling(project), spec.delegationCeiling ?? [])}),
       workspace: {projectId: project.id, nodeId: project.nodeId, cwd: project.workspace},
     }
   }
 
-  private spec(owner: string, actor: Binding | Task, modelId: string, parentBindingId?: string, hostModel = actor.hostModel): TurnSpec {
+  private spec(owner: string, actor: Binding | Task, modelId: string, parentBindingId?: string,
+    hostModel = actor.hostModel, remote?: ProjectMetadata): TurnSpec {
     if (actor.layer === 'L1' && !actor.privateWorkspace && this.config.defaultProjectId !== undefined && actor.target.projectId !== this.config.defaultProjectId) throw new Error('默认项目绑定已变更')
-    const project = actor.privateWorkspace ? undefined : resolveBinding(this.registry, owner, actor.target)
+    const project = actor.privateWorkspace ? undefined : remote ?? resolveBinding(this.registry, owner, actor.target)
     const config = this.currentConfig()
     const model = this.readHostModel
       ? hostModel ?? config.models[actor.layer].find(choice => choice.id === modelId) ?? config.models[actor.layer][0]
@@ -500,6 +583,7 @@ export class Orchestrator {
     return {
       owner: actor.layer === 'L1' && actor.privateWorkspace ? webOwner : owner,
       bindingId: actor.id, parentBindingId, layer: actor.layer, model: {...model}, workspace: {...actor.target},
+      depth: depths[actor.layer], maxDepth: this.maxDepth, ...(actor.room && {room: actor.room}),
       ...(actor.privateWorkspace && {internalWorkspace: true}),
       ...((owner === webOwner || this.profile) && {
         workspaceTitle: actor.layer === 'L1' ? '棱镜' : '棱镜 ' + actor.layer + ('title' in actor ? ' · ' + actor.title : ''),
@@ -553,44 +637,72 @@ export class Orchestrator {
       if (!this.permits(principal)) {
         throw new Error('渠道授权已撤销')
       }
-      const spec = this.spec(principal, actor, job.modelId, parent, job.hostModel)
+      const remote = actor.target.discovered ? await this.currentProject(principal, actor.target) : undefined
+      const spec = this.spec(principal, actor, job.modelId, parent, job.hostModel, remote)
       const extensions = this.profile?.extensions
       const featureTools = extensionTools(actor.layer, actor.specialist, !!extensions?.memory(),
         !!extensions?.triggers(), origin?.source.channel === 'trigger' ? false : !!origin)
-      const normalTools = toolSets[actor.layer].filter(tool => !actor.specialist ||
-        tool.name === 'send_parent' || tool.name === 'report_progress')
+      const normalTools = toolSets[actor.layer].filter(tool => {
+        if (actor.specialist) { return tool.name === 'send_parent' || tool.name === 'report_progress' }
+        return tool.name !== 'dispatch_executor' || this.maxDepth >= 2
+      })
+      if (actor.layer === 'L1' && this.profile?.mesh) { normalTools.push(batchSpawn) }
+      if (actor.layer === 'L2' && actor.room) { normalTools.push(peerSend) }
       const definitions = job.deliveryOnly ? toolSets.L1.filter(tool => tool.name === 'send_user')
         : [...normalTools, ...featureTools]
       const tools: AgentTools = {
         definitions: structuredClone(definitions),
         invoke: async (name, args) => {
           const values = toolArguments(definitions.find(tool => tool.name === name), args)
-          if (featureTools.some(tool => tool.name === name) &&
-            name !== 'spawn_memory_agent' && name !== 'spawn_event_author') {
-            const state = this.store.read(owner)
-            if (!state || !state.queue.some(item => item.id === job.id && item.worker === this.store.workerId) ||
+          const live = (state: Conversation | undefined = this.store.read(owner)) => {
+            if (this.stopping || !state?.queue.some(item => item.id === job.id && item.worker === this.store.workerId) ||
               !this.permits(principal)) {
               throw new Error('本轮工具权限已失效')
             }
-            if (!actor.privateWorkspace) { resolveBinding(this.registry, principal, actor.target) }
-            return this.invokeExtension(state, actor, job, name, values)
+          }
+          const state = this.store.read(owner)!
+          live(state)
+          if (!actor.privateWorkspace) { await this.currentProject(principal, actor.target) }
+          if (name === 'query_projects') {
+            const search = values.search === '' || values.search === undefined ? undefined : textField(values.search, 1024)
+            return (await this.projectIndex(principal, search)).map(({id, description, stack, nodeId, gitRemote, permissions}) => ({
+              id, description, stack, nodeId, permissions, ...(gitRemote === undefined ? {} : {gitRemote}),
+            }))
+          }
+          if (name === 'peer_send') {
+            return this.invokePeerTool(spec, values)
+          }
+          if (featureTools.some(tool => tool.name === name) &&
+            name !== 'spawn_memory_agent' && name !== 'spawn_event_author') {
+            const result = await this.invokeExtension(state, actor, job, name, values, live)
+            live()
+            return result
+          }
+          const destination = name === 'dispatch_planner' ? await this.dispatchProject(principal, values)
+            : name === 'dispatch_executor' ? remote : undefined
+          const assignments = name === 'agent_spawn' ? await this.prepareBatch(principal, values) : undefined
+          if (name === 'get_progress' || name === 'send_child') {
+            const child = this.directChild(state, actor.id, values.taskId, job.originId)
+            if (!child.privateWorkspace) { await this.currentProject(principal, child.target) }
           }
           const result = this.change(owner, state => {
-            if (!state.queue.some(item => item.id === job.id && item.worker === this.store.workerId)) throw new Error('本轮工具权限已失效')
-            if (!this.permits(principal)) throw new Error('渠道授权已撤销')
+            live(state)
             if (job.deliveryOnly) {
               if (name !== 'send_user') throw new Error('This delivery turn can only call send_user')
               const reply = job.originId && state.awaitingReplies?.[job.originId]
               if (!reply || reply.delivered) return {sent: true}
             }
-            return this.invoke(principal, state, actor.id, name, values, job)
+            if (assignments) {
+              return this.spawnBatch(principal, state, actor, job, assignments, values.room === true)
+            }
+            return this.invoke(principal, state, actor.id, name, values, job, destination)
           })
           this.publish(owner)
           this.wake(owner)
           return result
         },
       }
-      const input = job.deliveryOnly ? this.finalizationText(owner, job) : this.eventText(job, this.store.read(owner)!)
+      const input = job.deliveryOnly ? await this.finalizationText(owner, job) : this.eventText(job, this.store.read(owner)!)
       await this.runner.run(spec, input, tools)
       succeeded = true
     } catch (error) {
@@ -634,33 +746,35 @@ export class Orchestrator {
     }
   }
 
-  private finalizationText(owner: string, job: Job): string {
+  private async finalizationText(owner: string, job: Job): Promise<string> {
     const state = this.store.read(owner)
     const reply = job.originId && state?.awaitingReplies?.[job.originId]
     const original = state?.messages.find(message => message.id === job.originId)
     if (!state || !reply || !original) throw new Error('Missing pending delivery request')
-    const tasks = state.tasks.filter(task => reply.plannerIds.includes(task.id)).flatMap(task => {
+    const tasks = await Promise.all(state.tasks.filter(task => reply.plannerIds.includes(task.id)).map(async task => {
       // A grant may have changed between task completion and this last turn.
       // Reintroduce evidence only for a workspace that is still authorized.
       try {
         if (!task.privateWorkspace) {
-          resolveBinding(this.registry, this.principal(state, owner, job.originId), task.target)
+          await this.currentProject(this.principal(state, owner, job.originId), task.target)
         }
-      } catch { return [] }
-      return [{id: task.id, projectId: task.target.projectId, title: task.title, status: task.status,
-        result: task.finalReport ?? task.progress}]
-    })
+      } catch { return undefined }
+      return {id: task.id, projectId: task.target.projectId, title: task.title, status: task.status,
+        result: task.finalReport ?? task.progress}
+    }))
     return this.eventText(job, state, {
       kind: 'finalize_response',
       instruction: 'The delegated work has finished. Its final answer has not been delivered to the user. Call the send_user tool now with final=true, using the language and format of the specific user request below. Ordinary text is private and never delivered. Use these task results as evidence, sharing only the requested facts. If evidence is missing, explicitly send that limitation.',
-      userRequest: original.text, tasks,
+      userRequest: original.text, tasks: tasks.filter(task => task !== undefined),
     })
   }
 
   private eventText(job: Job, state: Conversation, event = JSON.parse(job.text) as Record<string, unknown>): string {
     const origin = job.originId && state.origins?.[job.originId]
+    const room = binding(state, job.bindingId).room
     return JSON.stringify(origin ? {
       eventId: job.id, requestId: job.originId, source: origin.source, replyTo: origin.replyTo, ...event,
+      ...(room && {room: {id: room.id, members: room.members}}),
     } : event)
   }
 
@@ -669,6 +783,7 @@ export class Orchestrator {
     if (!ok) task.turnFailed = true
     if (state.queue.some(item => item.bindingId === task.id) || children.some(child => !terminal(child))) return
     task.status = !task.turnFailed && children.every(child => child.status === 'completed') ? 'completed' : 'failed'
+    delete task.room
     task.at = now()
     const parent = binding(state, task.parent)
     enqueue(state, parent, JSON.stringify({
@@ -678,10 +793,10 @@ export class Orchestrator {
   }
 
   private invoke(owner: string, state: Conversation, id: string, name: string,
-    args: Record<string, unknown>, job: Job): unknown {
+    args: Record<string, unknown>, job: Job, destination?: ProjectMetadata): unknown {
     const {originId, deliveryOnly} = job
     const actor = binding(state, id)
-    if (!actor.privateWorkspace) {
+    if (!actor.privateWorkspace && !actor.target.discovered) {
       resolveBinding(this.registry, owner, actor.target)
     }
     switch (name) {
@@ -699,18 +814,12 @@ export class Orchestrator {
         }
         return {sent: true}
       }
-      case 'query_projects': {
-        const search = args.search === '' || args.search === undefined ? undefined : textField(args.search, 1024)
-        return this.registry.query(owner, search).map(({id, description, stack, nodeId, gitRemote, permissions}) => ({
-          id, description, stack, nodeId, permissions, ...(gitRemote === undefined ? {} : {gitRemote}),
-        }))
-      }
       case 'list_models': return publicCatalog(this.currentConfig().models[actor.layer === 'L1' ? 'L2' : 'L3'])
       case 'spawn_memory_agent':
       case 'spawn_event_author': return this.dispatch(owner, state, actor, args, originId,
         name === 'spawn_memory_agent' ? 'memory' : 'event')
       case 'dispatch_planner':
-      case 'dispatch_executor': return this.dispatch(owner, state, actor, args, originId)
+      case 'dispatch_executor': return this.dispatch(owner, state, actor, args, originId, undefined, destination)
       case 'report_progress': {
         const task = state.tasks.find(task => task.id === id)!
         task.progress = textField(args.text)
@@ -733,9 +842,7 @@ export class Orchestrator {
       }
       case 'get_progress':
       case 'send_child': {
-        const child = state.tasks.find(task => task.id === args.taskId && task.parent === id &&
-          (!this.profile || task.originId === originId))
-        if (!child) throw new PrismError('NOT_FOUND', '找不到直接子任务')
+        const child = this.directChild(state, id, args.taskId, originId)
         if (name === 'get_progress') {
           const children = state.tasks.filter(task => task.parent === child.id).map(({id, title, status, progress}) => ({id, title, status, progress}))
           return {
@@ -757,6 +864,13 @@ export class Orchestrator {
     }
   }
 
+  private directChild(state: Conversation, parentId: string, id: unknown, originId?: string): Task {
+    const child = state.tasks.find(task => task.id === id && task.parent === parentId &&
+      (!this.profile || task.originId === originId))
+    if (!child) { throw new PrismError('NOT_FOUND', '找不到直接子任务') }
+    return child
+  }
+
   private specialistWorkspace(kind: Specialist): string {
     const profile = this.profile
     const plugin = kind === 'memory' ? profile?.extensions?.memory() : profile?.extensions?.triggers()
@@ -769,7 +883,7 @@ export class Orchestrator {
   }
 
   private async invokeExtension(state: Conversation, actor: Binding, job: Job, name: string,
-    args: Record<string, unknown>): Promise<unknown> {
+    args: Record<string, unknown>, authorize: () => void): Promise<unknown> {
     const origin = job.originId ? state.origins?.[job.originId] : undefined
     if (!origin) { throw new Error('本轮缺少原请求') }
     const assets = state.messages.find(message => message.id === job.originId)?.attachments ?? []
@@ -802,7 +916,7 @@ export class Orchestrator {
       const body = args.body === '' && attachments?.length ? '' : textField(args.body, 512 * 1024)
       const input = {title: textField(args.title, 240), body, attachments}
       const key = createHash('sha256').update(JSON.stringify([actor.id, input])).digest('base64url')
-      return memory.write(input, key)
+      return memory.write(input, key, authorize)
     }
     if (triggers && origin.source.channel !== 'trigger') {
       if (name === 'event_add') { return triggers.add({providerId: textField(args.providerId, 128), params: args.params}, origin) }
@@ -815,20 +929,26 @@ export class Orchestrator {
   }
 
   remoteDefinitions(layer: Layer) {
-    return [...toolSets[layer], ...memoryQueries]
+    return [...toolSets[layer], ...memoryQueries, ...(layer === 'L2' ? [peerSend] : [])]
   }
 
   private dispatch(owner: string, state: Conversation, actor: Binding, args: Record<string, unknown>,
-    originId?: string, specialist?: Specialist): {taskId: string} {
+    originId?: string, specialist?: Specialist, remote?: ProjectMetadata): {taskId: string} {
     const layer = actor.layer === 'L1' ? 'L2' : 'L3'
+    if (depths[layer] > this.maxDepth) { throw new Error('派发层级超过 maxDepth') }
     const model = modelFor(this.currentConfig(), layer, textField(args.modelId, 256))
     const projectId = specialist ? 'prism-' + specialist
       : layer === 'L2' ? textField(args.projectId, 1024) : actor.target.projectId
-    const project = specialist ? undefined : this.registry.resolve(owner, projectId)
-    const target = layer === 'L3' ? {...actor.target} : project
-      ? {projectId, nodeId: project.nodeId, cwd: project.workspace}
+    const local = specialist || remote ? undefined : this.registry.resolve(owner, projectId)
+    const project = remote ?? local
+    const target: WorkspaceTarget = layer === 'L3' ? {...actor.target}
+      : remote ? {projectId, nodeId: remote.nodeId, cwd: '', discovered: true}
+      : local ? {projectId, nodeId: local.nodeId, cwd: local.workspace}
       : {projectId, nodeId: this.profile!.workspace.nodeId, cwd: this.specialistWorkspace(specialist!)}
-    if (project && (target.nodeId !== project.nodeId || target.cwd !== project.workspace)) throw new Error('项目绑定已变更')
+    if ((local && target.cwd !== local.workspace) || (project && target.nodeId !== project.nodeId) ||
+      (args.nodeId !== undefined && args.nodeId !== target.nodeId)) {
+      throw new Error('项目绑定已变更')
+    }
     const ceiling = project ? this.ceiling(project).filter(name => layer === 'L2' || actor.ceiling.includes(name)) : []
     const task: Task = {
       id: randomUUID(), layer, target, modelId: model.id, ceiling: narrow(ceiling, args.permissions),
@@ -846,6 +966,112 @@ export class Orchestrator {
     enqueue(state, task, JSON.stringify({kind: 'assignment', text: textField(args.instruction), projectId,
       permissions: task.ceiling, ...(attachments && {attachments})}), undefined, originId)
     return {taskId: task.id}
+  }
+
+  private async prepareBatch(owner: string, args: Record<string, unknown>) {
+    if (!Array.isArray(args.agents) || args.agents.length < 1 || args.agents.length > 12 ||
+      (args.room !== undefined && typeof args.room !== 'boolean') || (args.room && args.agents.length < 2)) {
+      throw new Error('L2 批次或 Room 参数无效')
+    }
+    const definition = {
+      parameters: (batchSpawn.parameters.properties as {agents: {items: Record<string, unknown>}}).agents.items,
+      name: batchSpawn.name, description: batchSpawn.description,
+    }
+    return Promise.all(args.agents.map(async item => {
+      const args = toolArguments(definition, item)
+      return {args, project: await this.dispatchProject(owner, args)}
+    }))
+  }
+
+  private spawnBatch(owner: string, state: Conversation, actor: Binding, job: Job,
+    assignments: Awaited<ReturnType<Orchestrator['prepareBatch']>>, share: boolean) {
+    const mesh = this.profile!.mesh!
+    const assignmentsById = assignments.map(({args, project}) => this.dispatch(owner, state, actor, args, job.originId, undefined, project))
+    const tasks = assignmentsById.map(({taskId}) => state.tasks.find(task => task.id === taskId)!)
+    if (!share) { return {tasks: assignmentsById} }
+    const room = {id: randomUUID(), coordinatorNode: mesh.nodeId,
+      members: tasks.map(task => ({agentId: task.id, nodeId: task.target.nodeId}))}
+    const authorized = {...room, grant: mesh.sign(roomPayload(room))}
+    for (const task of tasks) { task.room = authorized }
+    return {tasks: assignmentsById, room}
+  }
+
+  private verifyRoom(room: Room): MeshPort {
+    const mesh = this.profile?.mesh
+    if (!mesh || !mesh.verify(room.coordinatorNode, roomPayload(room), room.grant)) {
+      throw new Error('Room 授权签名无效')
+    }
+    return mesh
+  }
+
+  /** 工作节点用本机身份签名后，经 Mesh 直发给目标节点。 */
+  async invokePeerTool(spec: TurnSpec, raw: unknown, signal?: AbortSignal): Promise<{sent: boolean}> {
+    if (spec.layer !== 'L2' || !spec.room) { throw new Error('未获 Room 通信授权') }
+    const room = spec.room
+    const mesh = this.verifyRoom(room)
+    const args = toolArguments(peerSend, raw)
+    const nodeId = textField(args.target_node, 128)
+    const agentId = textField(args.target_agent_id, 128)
+    if (!hasMember(room, mesh.nodeId, spec.bindingId) || !hasMember(room, nodeId, agentId) ||
+      agentId === spec.bindingId) {
+      throw new Error('目标超出本批 L2 Room')
+    }
+    const message = {messageId: randomUUID(), room, senderAgentId: spec.bindingId,
+      targetAgentId: agentId, text: textField(args.text)}
+    const proof = mesh.sign(peerPayload(message, nodeId))
+    const timeout = AbortSignal.timeout(8000)
+    await mesh.peerSend({nodeId, agentId}, {messageId: message.messageId, room, senderAgentId: spec.bindingId,
+      text: message.text, proof}, signal ? AbortSignal.any([signal, timeout]) : timeout)
+    return {sent: true}
+  }
+
+  /** 目标节点验证直接相连的发送设备，再将收件交给持久队列。 */
+  async receivePeerMessage(sourceNodeId: string, message: PeerMessage, signal?: AbortSignal): Promise<void> {
+    const mesh = this.verifyRoom(message.room)
+    if (!hasMember(message.room, sourceNodeId, message.senderAgentId) ||
+      !hasMember(message.room, mesh.nodeId, message.targetAgentId) ||
+      !mesh.verify(sourceNodeId, peerPayload(message, mesh.nodeId), message.proof)) {
+      throw new Error('Room 消息发送者或目标无效')
+    }
+    await mesh.submitPeerInbox(message.room.coordinatorNode, {...message, sourceNodeId, targetNodeId: mesh.nodeId}, signal)
+  }
+
+  /** 协调节点以任务的原请求身份复核权限，并在确认前写入 Inbox。 */
+  async acceptPeerInbox(fromTargetNodeId: string, message: PeerInboxMessage): Promise<void> {
+    const {room, sourceNodeId, targetNodeId, senderAgentId, targetAgentId} = message
+    const mesh = this.verifyRoom(room)
+    if (this.stopping || room.coordinatorNode !== mesh.nodeId || fromTargetNodeId !== targetNodeId ||
+      !hasMember(room, sourceNodeId, senderAgentId) || !hasMember(room, targetNodeId, targetAgentId) ||
+      !mesh.verify(sourceNodeId, peerPayload(message, targetNodeId), message.proof)) {
+      throw new Error('Room 消息发送者或目标无效')
+    }
+    const receipt = JSON.stringify([room.id, sourceNodeId, senderAgentId, textField(message.messageId, 128)])
+    const activeMembers = (state: Conversation) => {
+      const sender = state.tasks.find(task => task.id === senderAgentId && task.target.nodeId === sourceNodeId)
+      const target = state.tasks.find(task => task.id === targetAgentId && task.target.nodeId === targetNodeId)
+      if (!sender || !target || sender === target || sender.layer !== 'L2' || target.layer !== 'L2' ||
+        terminal(sender) || terminal(target) || sender.room?.grant !== room.grant ||
+        target.room?.grant !== room.grant || sender.originId !== target.originId) {
+        throw new Error('Room 成员已结束或授权已撤销')
+      }
+      return {sender, target}
+    }
+    const state = this.store.read(sharedConversation)
+    if (!state) { throw new Error('Room 不存在') }
+    if (state.peerReceipts?.includes(receipt)) { return }
+    const {sender, target} = activeMembers(state)
+    const principal = this.principal(state, sharedConversation, target.originId)
+    await Promise.all([this.currentProject(principal, sender.target), this.currentProject(principal, target.target)])
+    this.change(sharedConversation, state => {
+      const received = state.peerReceipts ??= []
+      if (received.includes(receipt)) { return }
+      if (!this.permits(principal)) { throw new Error('渠道授权已撤销') }
+      const current = activeMembers(state).target
+      enqueue(state, current, JSON.stringify({kind: 'peer_message', senderAgentId, sourceNodeId,
+        text: textField(message.text)}), undefined, current.originId)
+      received.push(receipt)
+    })
+    this.wake(sharedConversation)
   }
 
   /** Wait for all in-process work, including events enqueued by completing agents. */

@@ -4,6 +4,7 @@ import {join} from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import type {Layer, MessageSource, ModelConfig, PublicMessage, ReplyRoute, TaskCard, WorkspaceTarget} from './contracts.js'
 import type {MediaAsset, Specialist} from './extensions.js'
+import type {Room} from './mesh-port.js'
 
 export interface Binding {
   id: string
@@ -14,6 +15,7 @@ export interface Binding {
   ceiling: string[]
   privateWorkspace?: true
   specialist?: Specialist
+  room?: Room
 }
 
 export interface Task extends Binding {
@@ -52,6 +54,7 @@ export interface Conversation {
   origins?: Record<string, RequestOrigin>
   modelChoices?: Record<string, string>
   stagedMedia?: Record<string, Record<string, MediaAsset>>
+  peerReceipts?: string[]
   requests: string[]
   queue: Job[]
 }

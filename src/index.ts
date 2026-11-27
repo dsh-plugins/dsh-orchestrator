@@ -5,11 +5,12 @@ import { isAbsolute, join, relative, sep } from 'node:path'
 import { dshPath } from '@deepseek-ai/dsh-home-paths'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type {} from '@dsh-prism/dsh-workspace-registry'
-import type { HostModelConfig, Layer, OrchestratorConfig, RegistryPort, SessionRunner, ToolDefinition, TurnSpec } from './contracts.js'
+import type { HostModelConfig, Layer, OrchestratorConfig, ProjectMetadata, RegistryPort, SessionRunner, ToolDefinition, TurnSpec } from './contracts.js'
 import { Orchestrator } from './core.js'
 import { DshSessionRunner } from './host.js'
 import { PrismProvider, ProviderRouter } from './provider.js'
 import type { PrismMemory, PrismTriggers } from './extensions.js'
+import type { MeshPort, PeerInboxMessage, PeerMessage } from './mesh-port.js'
 import type {} from './model-settings.js'
 
 export * from './core.js'
@@ -23,14 +24,16 @@ export const inject = ['prismRegistry', 'dshMesh', 'subagents', 'agents', 'agent
 
 export type Config = (OrchestratorConfig | HostModelConfig) & { stateDirectory?: string }
 
-interface MeshService {
-  nodeId: string
-  nodeIds: readonly string[]
+interface MeshService extends MeshPort {
   runnerFor(nodeId: string): SessionRunner
   attach(worker: {
     runner: SessionRunner
     authorize(spec: TurnSpec): TurnSpec
     definitionsFor(layer: Layer): ToolDefinition[]
+    queryProjects(owner: string, search?: string): ProjectMetadata[]
+    receivePeerMessage(fromNodeId: string, message: PeerMessage, signal?: AbortSignal): Promise<void>
+    acceptPeerInbox(fromTargetNodeId: string, message: PeerInboxMessage): Promise<void>
+    invokePeerTool(spec: TurnSpec, args: unknown, signal?: AbortSignal): Promise<unknown>
   }): () => void
 }
 declare module '@deepseek-ai/cordis' {
@@ -88,6 +91,7 @@ export async function apply(ctx: Context, config: Config) {
     return { id: model, provider, description: provider }
   }, () => ctx.get('prismModelRules')?.(), workspace ? {
     workspace: {projectId: 'prism-conversation', nodeId: mesh.nodeId, cwd: workspace},
+    ...(typeof mesh.queryProjects === 'function' && {mesh}),
     extensions: {
       memory: () => ctx.get('prismMemory', true) as PrismMemory | undefined,
       triggers: () => ctx.get('prismTriggers', true) as PrismTriggers | undefined,
@@ -98,7 +102,15 @@ export async function apply(ctx: Context, config: Config) {
       core.refreshModels()
     }
   })
-  const detach = mesh.attach({ runner: local, authorize: spec => core.authorizeRemote(spec), definitionsFor: layer => core.remoteDefinitions(layer) })
+  const detach = mesh.attach({
+    runner: local,
+    authorize: spec => core.authorizeRemote(spec),
+    definitionsFor: layer => core.remoteDefinitions(layer),
+    queryProjects: (owner, search) => core.exportProjects(owner, search),
+    receivePeerMessage: (from, message, signal) => core.receivePeerMessage(from, message, signal),
+    acceptPeerInbox: (from, message) => core.acceptPeerInbox(from, message),
+    invokePeerTool: (spec, args, signal) => core.invokePeerTool(spec, args, signal),
+  })
   const close = async () => {
     router.close()
     detach()

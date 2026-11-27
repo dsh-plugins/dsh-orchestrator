@@ -21,8 +21,9 @@ export interface PrismMemory {
     documentId: string; title: string; body: string; attachments: (MediaAsset & {description?: string})[]
   } | undefined>
   write(input: {title: string; body: string; attachments?: {assetId: string; description?: string}[]},
-    idempotencyKey: string): Promise<{documentId: string}>
+    idempotencyKey: string, authorize?: () => void): Promise<{documentId: string}>
   stageMedia(input: MediaUpload): Promise<MediaAsset>
+  pinMedia?(assetIds: readonly string[]): Promise<void>
   readMedia(assetId: string): Promise<(MediaAsset & {bytes: Uint8Array}) | undefined>
 }
 
