@@ -1,3 +1,4 @@
+import type {ModelSelection} from '@deepseek-ai/dsh-agent'
 import type {MediaAsset} from './extensions.js'
 import type {Room} from './mesh-port.js'
 
@@ -19,6 +20,8 @@ export interface ModelConfig {
   id: string
   provider?: string
   model?: string
+  /** The effort id is owned by the selected provider route. */
+  reasoningEffort?: ModelSelection['reasoningEffort']
   description: string
   prompt?: string
   promptMode?: 'append' | 'replace'

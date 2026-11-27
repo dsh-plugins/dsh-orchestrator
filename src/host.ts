@@ -195,9 +195,11 @@ export class DshSessionRunner implements SessionRunner {
         installed = true
       })
       if (!installed) throw new Error('Role tools could not be installed')
+      const { provider, model, id, reasoningEffort } = spec.model
       agent.model.select({
-        provider: spec.model.provider ?? this.ctx.agentDefaultModel.currentSelection().provider,
-        model: spec.model.model ?? spec.model.id,
+        provider: provider ?? this.ctx.agentDefaultModel.currentSelection().provider,
+        model: model ?? id,
+        ...(reasoningEffort !== undefined && { reasoningEffort }),
       })
     }
   }

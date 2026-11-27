@@ -44,13 +44,18 @@ function routeId(provider: string, model: string): string {
 
 /** 将启用的规则转换为可派发模型，空规则使用 DSH 当前默认模型。 */
 export function permittedModels(rules: readonly ModelRule[] | undefined, fallback: ModelConfig): ModelConfig[] {
-  const enabled = rules?.filter(rule => rule.enabled).map(rule => ({
-    id: routeId(rule.provider, rule.model),
-    provider: rule.provider,
-    model: rule.model,
-    description: rule.description.trim() || rule.provider + '/' + rule.model,
-    ...(rule.prompt.trim() && { prompt: rule.prompt }),
-  }))
+  const enabled = rules?.filter(rule => rule.enabled).map(rule => {
+    const reasoningEffort = rule.provider === fallback.provider && rule.model === (fallback.model ?? fallback.id)
+      ? fallback.reasoningEffort : undefined
+    return {
+      id: routeId(rule.provider, rule.model),
+      provider: rule.provider,
+      model: rule.model,
+      description: rule.description.trim() || rule.provider + '/' + rule.model,
+      ...(reasoningEffort !== undefined && { reasoningEffort }),
+      ...(rule.prompt.trim() && { prompt: rule.prompt }),
+    }
+  })
   return enabled?.length ? enabled : [fallback]
 }
 

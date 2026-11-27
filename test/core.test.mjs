@@ -4,6 +4,7 @@ import {mkdtemp, rm} from 'node:fs/promises'
 import {join} from 'node:path'
 import {tmpdir} from 'node:os'
 import {Orchestrator} from '../dist/core.js'
+import {permittedModels} from '../dist/policy.js'
 
 const model = id => ({id, description: id + ' 的能力', prompt: id + ' 的提示词', promptMode: 'append'})
 const config = {
@@ -332,7 +333,7 @@ test('host defaults follow the native model picker and the initial project stays
   const runner = {
     async run(spec, raw, tools) {
       const event = JSON.parse(raw)
-      seen.push([spec.workspace.projectId, spec.model.provider, spec.model.id])
+      seen.push([spec.workspace.projectId, spec.model.provider, spec.model.id, spec.model.reasoningEffort])
       if (event.text === 'first') {
         firstTurn.resolve()
         await continueFirstTurn.promise
@@ -353,13 +354,13 @@ test('host defaults follow the native model picker and the initial project stays
     assert.equal((await core.view('alice')).modelId, 'initial')
     await core.message('alice', 'first')
     await firstTurn.promise
-    route = {id:'flash', provider:'custom', description:'Custom route'}
+    route = {id:'flash', provider:'custom', description:'Custom route', reasoningEffort:'high'}
     await core.message('alice', 'second')
-    route = {...route, provider:'another-route'}
+    route = {id:'flash', provider:'another-route', description:'Custom route'}
     assert.deepEqual((await core.view('alice')).models, [{id:'flash', description:'Custom route'}])
     continueFirstTurn.resolve()
     await core.whenIdle()
-    assert.deepEqual(seen, [['invoice','first','initial'],['invoice','custom','flash']])
+    assert.deepEqual(seen, [['invoice','first','initial',undefined],['invoice','custom','flash','high']])
   } finally { continueFirstTurn.resolve(); await core.close() }
 
   const resumed = open()
@@ -368,7 +369,7 @@ test('host defaults follow the native model picker and the initial project stays
     await resumed.start()
     await resumed.message('alice', 'revoke-active')
     await resumed.whenIdle()
-    assert.deepEqual(seen.at(-1), ['invoice','another-route','flash'])
+    assert.deepEqual(seen.at(-1), ['invoice','another-route','flash',undefined])
     await assert.rejects(resumed.message('alice', 'after-revoke', 'retry-after-grant'))
     assert.equal((await resumed.view('alice')).messages.length, 3)
     assert.equal(seen.length, 3)
@@ -376,12 +377,26 @@ test('host defaults follow the native model picker and the initial project stays
     await resumed.message('alice', 'after-revoke', 'retry-after-grant')
     await resumed.message('alice', 'after-revoke', 'retry-after-grant')
     await resumed.whenIdle()
-    assert.deepEqual(seen.at(-1), ['lobby','another-route','flash'])
+    assert.deepEqual(seen.at(-1), ['lobby','another-route','flash',undefined])
     assert.equal(seen.length, 4)
     const {messages} = await resumed.view('alice')
     assert.deepEqual(messages.map(m => m.text), ['first','second','revoke-active','after-revoke'])
     assert.equal(messages.at(-1).delivery, 'processed')
   } finally { await resumed.close() }
+})
+
+test('enabled layer rules inherit the native reasoning effort for the exact provider and model', () => {
+  const fallback = {id: 'flash', provider: 'responses', description: 'Responses', reasoningEffort: 'high'}
+  const rule = (provider, model) => ({provider, model, enabled: true, description: '', prompt: ''})
+  const rules = [rule('responses', 'flash'), rule('another', 'flash'), rule('responses', 'alternative')]
+
+  const models = permittedModels(rules, fallback)
+  assert.deepEqual(models.map(model => model.reasoningEffort), ['high', undefined, undefined])
+  assert.deepEqual(permittedModels([], fallback), [fallback])
+
+  const updated = permittedModels(rules, {...fallback, reasoningEffort: undefined})
+  assert.equal(updated[0].id, models[0].id)
+  assert.equal(updated[0].reasoningEffort, undefined)
 })
 
 test('moving a project creates a new root without redirecting queued work or losing conversation history', {timeout:10000}, async t => {

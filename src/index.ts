@@ -106,8 +106,8 @@ export async function apply(ctx: Context, config: Config) {
   const unwatchNodes = mesh.onNodesChanged?.(syncProviders)
   const router = new ProviderRouter(ctx.subagents)
   const core = new Orchestrator(config, registry, router, directory, () => {
-    const { provider, model } = ctx.agentDefaultModel.currentSelection()
-    return { id: model, provider, description: provider }
+    const { provider, model, reasoningEffort } = ctx.agentDefaultModel.currentSelection()
+    return { id: model, provider, description: provider, ...(reasoningEffort !== undefined && { reasoningEffort }) }
   }, () => ctx.get('prismModelRules')?.(), workspace ? {
     workspace: {projectId: 'prism-conversation', nodeId: mesh.nodeId, cwd: workspace},
     ...(typeof mesh.queryProjects === 'function' && {mesh}),

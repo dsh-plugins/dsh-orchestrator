@@ -24,7 +24,9 @@ export function apply(ctx, config) {
       const layers = ['L1', 'L2', 'L3']
       for (const layer of layers) {
         const bindingId = 'binding-' + layer
-        const spec = { bindingId, layer, owner: 'test', model: { id: 'offline-test', provider: 'probe', description: '' },
+        const reasoningEffort = layer === 'L2' ? undefined : 'high'
+        const spec = { bindingId, layer, owner: 'test',
+          model: { id: 'offline-test', provider: 'probe', description: '', reasoningEffort },
           workspace: { projectId: 'test', nodeId: 'local', cwd: config.directory },
           parentBindingId: layer === 'L1' ? undefined : 'binding-' + (layer === 'L2' ? 'L1' : 'L2'),
           systemPrompt: '测试提示词', allowedTools: layer === 'L3' ? ['read'] : [] }
@@ -39,7 +41,9 @@ export function apply(ctx, config) {
             const names = ctx.tools.schemas(agent).map(tool => tool.name).sort()
             assert.deepEqual(names, layer === 'L3' ? ['read', 'verify_probe'] : ['verify_probe'])
             assert.equal(agent.session.header.cwd, config.directory)
-            assert.equal(agent.model.current()?.model, spec.model.id)
+            assert.deepEqual(agent.model.current(), {
+              provider: 'probe', model: spec.model.id, ...(reasoningEffort !== undefined && { reasoningEffort }),
+            })
             if (previous) {
               assert.equal(agent.session.header.parentSession, ids.at(-1))
               assert.ok(agent.session.header.isSeeded)
