@@ -1,8 +1,12 @@
 import { messages } from './messages.js'
 import {createHash, randomUUID} from 'node:crypto'
+import {realpathSync} from 'node:fs'
+import {dirname, join} from 'node:path'
 import type {AgentTools, ConversationView, HostModelConfig, Layer, MessageSource, ModelConfig, ModelRules, OrchestratorConfig, ProjectMetadata, RegistryPort, ReplyRoute, SessionRunner, TraceEntry, TurnSpec, WorkspaceTarget} from './contracts.js'
 import {modelFor, nativeExecutionTools, permittedModels, remoteModelFor, resolveBinding, systemPrompt, toolSets, validateConfig} from './policy.js'
 import {ConversationStore, enqueue, type Binding, type Conversation, type Job, type Task} from './store.js'
+import {extensionTools, memoryQueries, toolArguments, type MediaAsset, type MediaUpload,
+  type PrismExtensions, type Specialist, type TriggerEvent} from './extensions.js'
 
 export type * from './contracts.js'
 
@@ -45,6 +49,7 @@ const webOwner = 'web:owner'
 /** 私有工作区与渠道的生命周期由 Cordis 宿主提供。 */
 export interface ProfileConversation {
   workspace: WorkspaceTarget
+  extensions?: PrismExtensions
 }
 
 export class Orchestrator {
@@ -253,6 +258,7 @@ export class Orchestrator {
         id: task.id, title: task.layer === 'L3' ? '执行步骤' : task.title,
         status: task.status, at: task.at, ...(task.layer === 'L3' ? {parentId: task.parent} : {}),
       })),
+      ...(this.profile?.extensions?.memory() && {mediaEnabled: true}),
     }
   }
 
@@ -265,9 +271,13 @@ export class Orchestrator {
     return state ? this.snapshot(state, owner) : this.change(conversation, state => this.snapshot(state, owner))
   }
 
-  async message(owner: string, text: string, requestId?: string, source?: MessageSource): Promise<ConversationView> {
+  async message(owner: string, text: string, requestId?: string, source?: MessageSource,
+    attachmentIds: readonly string[] = []): Promise<ConversationView> {
     if (this.stopping) throw new Error('服务正在关闭')
-    textField(text)
+    if (!attachmentIds.length || text !== '') { textField(text) }
+    if (attachmentIds.length > 8 || (attachmentIds.length && !this.profile?.extensions?.memory())) {
+      throw new PrismError('INVALID_INPUT', '附件数量超限或记忆插件未启用')
+    }
     if (requestId !== undefined) textField(requestId, 1024)
     const conversation = this.conversationId(owner)
     if (!this.permits(owner)) {
@@ -284,12 +294,21 @@ export class Orchestrator {
       const at = now()
       const route = this.profile ? this.route(owner) : undefined
       const sender = this.profile ? (source ?? {channel: owner === webOwner ? 'web' : 'im'}) : undefined
+      const staged = route && state.stagedMedia?.[route.replyTo]
+      const attachments = [...new Set(attachmentIds)].map(id => {
+        const asset = staged?.[textField(id, 128)]
+        if (!asset || !Object.hasOwn(staged!, id)) {
+          throw new PrismError('INVALID_INPUT', '附件不属于当前发送方')
+        }
+        return asset
+      })
       if (route && sender) {
         const origins = state.origins ??= {}
         origins[messageId] = {...route, source: sender}
       }
       state.messages.push({id: messageId, role: 'user', delivery: 'pending', text, at,
-        ...(sender && {source: sender, originId: messageId})})
+        ...(sender && {source: sender, originId: messageId}),
+        ...(attachments.length && {attachments})})
       if (this.readHostModel && !this.profile) {
         state.root.hostModel = this.selectedModel(state.root, this.currentConfig())
         state.root.modelId = state.root.hostModel.id
@@ -300,7 +319,7 @@ export class Orchestrator {
         awaiting[originId] = {rootId: state.root.id, plannerIds: [],
           hostModel: this.profile ? this.requestModel(state, owner) : state.root.hostModel}
       }
-      enqueue(state, state.root, JSON.stringify({kind: 'user', text,
+      enqueue(state, state.root, JSON.stringify({kind: 'user', text, ...(attachments.length && {attachments}),
         ...(route && {eventId: eventId ?? messageId, requestId: messageId, source: sender, replyTo: route.replyTo, at}),
       }), messageId, originId)
       return this.snapshot(state, owner)
@@ -312,6 +331,67 @@ export class Orchestrator {
 
   private route(principal: string): ReplyRoute {
     return {principal, replyTo: createHash('sha256').update(principal).digest('base64url')}
+  }
+
+  /** 在当前发送方的 Profile 中暂存经过格式校验的媒体。 */
+  async stageMedia(owner: string, input: MediaUpload): Promise<MediaAsset> {
+    const memory = this.profile?.extensions?.memory()
+    if (this.stopping || !memory || !this.permits(owner)) {
+      throw new PrismError('INVALID_INPUT', '附件服务不可用')
+    }
+    const conversation = this.conversationId(owner)
+    const asset = await memory.stageMedia(input)
+    if (this.stopping || !this.permits(owner)) {
+      throw new PrismError('INVALID_INPUT', '发送方未获授权')
+    }
+    this.change(conversation, state => {
+      const staged = state.stagedMedia ??= {}
+      const assets = staged[this.route(owner).replyTo] ??= {}
+      assets[asset.assetId] = asset
+    })
+    return asset
+  }
+
+  /** 只有网页所有者可以读取显示在共享时间线中的媒体原件。 */
+  async readMedia(owner: string, assetId: string): Promise<(MediaAsset & {bytes: Uint8Array}) | undefined> {
+    if (owner !== webOwner || !this.profile) { return undefined }
+    const state = this.store.read(this.conversationId(owner))
+    if (!state?.messages.some(message => message.attachments?.some(asset => asset.assetId === assetId))) {
+      return undefined
+    }
+    return this.profile.extensions?.memory()?.readMedia(assetId)
+  }
+
+  /** 与消息投递共用 SQLite Inbox，事务提交后才确认事件。 */
+  async acceptTrigger(event: TriggerEvent): Promise<void> {
+    if (this.stopping || !this.profile) { throw new Error('事件 Inbox 不可用') }
+    const {route} = event
+    if (this.route(textField(route.principal, 2048)).replyTo !== route.replyTo) {
+      throw new Error('事件回复目标无效')
+    }
+    const access = this.access(route.principal)
+    if (access && !access(route.principal)) { return }
+    const eventId = 'trigger:' + textField(event.eventId, 1024)
+    this.change(sharedConversation, state => {
+      if (state.requests.includes(eventId)) { return }
+      state.requests.push(eventId)
+      const id = randomUUID()
+      const source = {channel: 'trigger', sender: textField(event.source, 256)}
+      const at = now()
+      const payload = event.payload
+      const text = JSON.stringify(payload ?? null)
+      textField(text)
+      const origins = state.origins ??= {}
+      origins[id] = {...route, source}
+      state.messages.push({id, role: 'user', text, source, originId: id, at})
+      const awaiting = state.awaitingReplies ??= {}
+      awaiting[id] = {rootId: state.root.id, plannerIds: [], hostModel: this.requestModel(state, route.principal)}
+      enqueue(state, state.root, JSON.stringify({
+        kind: 'trigger_event', eventId: event.eventId, at: event.occurredAt, payload,
+      }), undefined, id)
+    })
+    this.publish(sharedConversation)
+    this.wake(sharedConversation)
   }
 
   async selectModel(owner: string, modelId: string): Promise<ConversationView> {
@@ -411,6 +491,12 @@ export class Orchestrator {
       ? hostModel ?? config.models[actor.layer].find(choice => choice.id === modelId) ?? config.models[actor.layer][0]
       : modelFor(config, actor.layer, modelId)
     const currentCeiling = project ? this.ceiling(project).filter(tool => actor.ceiling.includes(tool)) : []
+    if (actor.specialist && this.specialistWorkspace(actor.specialist) !== actor.target.cwd) {
+      throw new Error('专用智能体工作区已变更')
+    }
+    const specialistPrompt = actor.specialist === 'memory'
+      ? '将原请求中值得长期保留的信息整理为完整文档。使用 memory_write 保存，保留附件引用和有依据的描述，再用 send_parent 交付文档 ID。'
+      : '编写符合 @dsh-prism/dsh-triggers/protocol 的 TypeScript Provider。导出 version、initialize 和 fire。用 event_provider_publish 编译并挂载，随后用 send_parent 报告 Provider ID 和参数。'
     return {
       owner: actor.layer === 'L1' && actor.privateWorkspace ? webOwner : owner,
       bindingId: actor.id, parentBindingId, layer: actor.layer, model: {...model}, workspace: {...actor.target},
@@ -420,7 +506,7 @@ export class Orchestrator {
       }),
       allowedTools: actor.layer === 'L3' ? currentCeiling : [],
       ...(actor.layer === 'L2' && {delegationCeiling: currentCeiling}),
-      systemPrompt: systemPrompt(actor.layer, model),
+      systemPrompt: actor.specialist ? specialistPrompt : systemPrompt(actor.layer, model),
     }
   }
 
@@ -455,11 +541,12 @@ export class Orchestrator {
       job.worker = this.store.workerId
       const task = state.tasks.find(task => task.id === id)
       if (task) { task.status = 'running'; task.at = now() }
-      return {job, actor: binding(state, id), parent: task?.parent}
+      return {job, actor: binding(state, id), parent: task?.parent,
+        origin: job.originId ? state.origins?.[job.originId] : undefined}
     })
     if (!claimed) return
     this.publish(owner)
-    const {actor, job, parent} = claimed
+    const {actor, job, parent, origin} = claimed
     let succeeded = false
     try {
       const principal = this.principal(this.store.read(owner)!, owner, job.originId)
@@ -467,9 +554,27 @@ export class Orchestrator {
         throw new Error('渠道授权已撤销')
       }
       const spec = this.spec(principal, actor, job.modelId, parent, job.hostModel)
+      const extensions = this.profile?.extensions
+      const featureTools = extensionTools(actor.layer, actor.specialist, !!extensions?.memory(),
+        !!extensions?.triggers(), origin?.source.channel === 'trigger' ? false : !!origin)
+      const normalTools = toolSets[actor.layer].filter(tool => !actor.specialist ||
+        tool.name === 'send_parent' || tool.name === 'report_progress')
+      const definitions = job.deliveryOnly ? toolSets.L1.filter(tool => tool.name === 'send_user')
+        : [...normalTools, ...featureTools]
       const tools: AgentTools = {
-        definitions: structuredClone(job.deliveryOnly ? toolSets.L1.filter(tool => tool.name === 'send_user') : toolSets[actor.layer]),
+        definitions: structuredClone(definitions),
         invoke: async (name, args) => {
+          const values = toolArguments(definitions.find(tool => tool.name === name), args)
+          if (featureTools.some(tool => tool.name === name) &&
+            name !== 'spawn_memory_agent' && name !== 'spawn_event_author') {
+            const state = this.store.read(owner)
+            if (!state || !state.queue.some(item => item.id === job.id && item.worker === this.store.workerId) ||
+              !this.permits(principal)) {
+              throw new Error('本轮工具权限已失效')
+            }
+            if (!actor.privateWorkspace) { resolveBinding(this.registry, principal, actor.target) }
+            return this.invokeExtension(state, actor, job, name, values)
+          }
           const result = this.change(owner, state => {
             if (!state.queue.some(item => item.id === job.id && item.worker === this.store.workerId)) throw new Error('本轮工具权限已失效')
             if (!this.permits(principal)) throw new Error('渠道授权已撤销')
@@ -478,7 +583,7 @@ export class Orchestrator {
               const reply = job.originId && state.awaitingReplies?.[job.originId]
               if (!reply || reply.delivered) return {sent: true}
             }
-            return this.invoke(principal, state, actor.id, name, args, job)
+            return this.invoke(principal, state, actor.id, name, values, job)
           })
           this.publish(owner)
           this.wake(owner)
@@ -572,19 +677,12 @@ export class Orchestrator {
     }), undefined, originId)
   }
 
-  private invoke(owner: string, state: Conversation, id: string, name: string, raw: unknown, job: Job): unknown {
+  private invoke(owner: string, state: Conversation, id: string, name: string,
+    args: Record<string, unknown>, job: Job): unknown {
     const {originId, deliveryOnly} = job
     const actor = binding(state, id)
     if (!actor.privateWorkspace) {
       resolveBinding(this.registry, owner, actor.target)
-    }
-    const definition = toolSets[actor.layer].find(tool => tool.name === name)
-    if (!definition || !raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('该层无权调用此工具，或参数格式无效')
-    const args = raw as Record<string, unknown>
-    const schema = definition.parameters
-    const properties = schema.properties as Record<string, unknown>
-    if (Object.keys(args).some(key => !Object.hasOwn(properties, key)) || (schema.required as string[]).some(key => !Object.hasOwn(args, key))) {
-      throw new Error('工具参数超出声明或缺少必填项')
     }
     switch (name) {
       case 'send_user': {
@@ -608,6 +706,9 @@ export class Orchestrator {
         }))
       }
       case 'list_models': return publicCatalog(this.currentConfig().models[actor.layer === 'L1' ? 'L2' : 'L3'])
+      case 'spawn_memory_agent':
+      case 'spawn_event_author': return this.dispatch(owner, state, actor, args, originId,
+        name === 'spawn_memory_agent' ? 'memory' : 'event')
       case 'dispatch_planner':
       case 'dispatch_executor': return this.dispatch(owner, state, actor, args, originId)
       case 'report_progress': {
@@ -656,17 +757,83 @@ export class Orchestrator {
     }
   }
 
-  private dispatch(owner: string, state: Conversation, actor: Binding, args: Record<string, unknown>, originId?: string): {taskId: string} {
+  private specialistWorkspace(kind: Specialist): string {
+    const profile = this.profile
+    const plugin = kind === 'memory' ? profile?.extensions?.memory() : profile?.extensions?.triggers()
+    if (!profile || !plugin) { throw new Error('专用智能体插件未启用') }
+    const workspace = join(dirname(profile.workspace.cwd), kind === 'memory' ? 'memories' : 'events')
+    if (realpathSync(workspace) !== workspace || realpathSync(plugin.workspace) !== workspace) {
+      throw new Error('专用智能体只能使用当前 Profile 的私有工作区')
+    }
+    return workspace
+  }
+
+  private async invokeExtension(state: Conversation, actor: Binding, job: Job, name: string,
+    args: Record<string, unknown>): Promise<unknown> {
+    const origin = job.originId ? state.origins?.[job.originId] : undefined
+    if (!origin) { throw new Error('本轮缺少原请求') }
+    const assets = state.messages.find(message => message.id === job.originId)?.attachments ?? []
+    const assetId = (id: unknown) => {
+      if (!assets.some(asset => asset.assetId === id)) {
+        throw new Error('附件不属于原请求')
+      }
+      return String(id)
+    }
+    const memory = this.profile?.extensions?.memory()
+    const triggers = this.profile?.extensions?.triggers()
+    if (name === 'memory_search' && memory) {
+      const query = args.query === undefined ? undefined : textField(args.query)
+      if (args.limit !== undefined && (typeof args.limit !== 'number' || !Number.isInteger(args.limit) ||
+        args.limit < 1 || args.limit > 20)) {
+        throw new Error('limit 必须是 1 至 20 的整数')
+      }
+      return memory.search({query, assetId: args.assetId === undefined ? undefined : assetId(args.assetId),
+        limit: args.limit as number | undefined})
+    }
+    if (name === 'memory_get' && memory) { return (await memory.get(textField(args.documentId, 128))) ?? null }
+    if (name === 'memory_write' && memory && actor.specialist === 'memory') {
+      if (args.attachments !== undefined && (!Array.isArray(args.attachments) || args.attachments.length > 8)) {
+        throw new Error('附件格式或数量无效')
+      }
+      const attachments = (args.attachments as {assetId: unknown; description?: unknown}[] | undefined)?.map(asset => ({
+        assetId: assetId(asset?.assetId), description: asset?.description === undefined
+          ? undefined : textField(asset.description, 4000),
+      }))
+      const body = args.body === '' && attachments?.length ? '' : textField(args.body, 512 * 1024)
+      const input = {title: textField(args.title, 240), body, attachments}
+      const key = createHash('sha256').update(JSON.stringify([actor.id, input])).digest('base64url')
+      return memory.write(input, key)
+    }
+    if (triggers && origin.source.channel !== 'trigger') {
+      if (name === 'event_add') { return triggers.add({providerId: textField(args.providerId, 128), params: args.params}, origin) }
+      if (name === 'event_remove') { return {removed: await triggers.remove(textField(args.id, 128), origin)} }
+      if (name === 'event_provider_publish' && actor.specialist === 'event') {
+        return triggers.publish({providerId: textField(args.providerId, 128), source: textField(args.source, 128 * 1024)})
+      }
+    }
+    throw new Error('本轮工具权限已失效')
+  }
+
+  remoteDefinitions(layer: Layer) {
+    return [...toolSets[layer], ...memoryQueries]
+  }
+
+  private dispatch(owner: string, state: Conversation, actor: Binding, args: Record<string, unknown>,
+    originId?: string, specialist?: Specialist): {taskId: string} {
     const layer = actor.layer === 'L1' ? 'L2' : 'L3'
     const model = modelFor(this.currentConfig(), layer, textField(args.modelId, 256))
-    const projectId = layer === 'L2' ? textField(args.projectId, 1024) : actor.target.projectId
-    const project = this.registry.resolve(owner, projectId)
-    const target = layer === 'L2' ? {projectId, nodeId: project.nodeId, cwd: project.workspace} : {...actor.target}
-    if (target.nodeId !== project.nodeId || target.cwd !== project.workspace) throw new Error('项目绑定已变更')
-    const ceiling = this.ceiling(project).filter(name => layer === 'L2' || actor.ceiling.includes(name))
+    const projectId = specialist ? 'prism-' + specialist
+      : layer === 'L2' ? textField(args.projectId, 1024) : actor.target.projectId
+    const project = specialist ? undefined : this.registry.resolve(owner, projectId)
+    const target = layer === 'L3' ? {...actor.target} : project
+      ? {projectId, nodeId: project.nodeId, cwd: project.workspace}
+      : {projectId, nodeId: this.profile!.workspace.nodeId, cwd: this.specialistWorkspace(specialist!)}
+    if (project && (target.nodeId !== project.nodeId || target.cwd !== project.workspace)) throw new Error('项目绑定已变更')
+    const ceiling = project ? this.ceiling(project).filter(name => layer === 'L2' || actor.ceiling.includes(name)) : []
     const task: Task = {
       id: randomUUID(), layer, target, modelId: model.id, ceiling: narrow(ceiling, args.permissions),
       ...(this.config.useHostModel && {hostModel: model}),
+      ...(specialist && {privateWorkspace: true, specialist}),
       parent: actor.id, title: textField(args.title, 240), progress: '', at: now(), status: 'queued', originId,
     }
     state.tasks.push(task)
@@ -675,7 +842,9 @@ export class Orchestrator {
       reply.delivered = false
       reply.plannerIds.push(task.id)
     }
-    enqueue(state, task, JSON.stringify({kind: 'assignment', text: textField(args.instruction), projectId, permissions: task.ceiling}), undefined, originId)
+    const attachments = specialist === 'memory' ? state.messages.find(message => message.id === originId)?.attachments : undefined
+    enqueue(state, task, JSON.stringify({kind: 'assignment', text: textField(args.instruction), projectId,
+      permissions: task.ceiling, ...(attachments && {attachments})}), undefined, originId)
     return {taskId: task.id}
   }
 

@@ -9,7 +9,7 @@ import type { HostModelConfig, Layer, OrchestratorConfig, RegistryPort, SessionR
 import { Orchestrator } from './core.js'
 import { DshSessionRunner } from './host.js'
 import { PrismProvider, ProviderRouter } from './provider.js'
-import { toolSets } from './policy.js'
+import type { PrismMemory, PrismTriggers } from './extensions.js'
 import type {} from './model-settings.js'
 
 export * from './core.js'
@@ -88,13 +88,17 @@ export async function apply(ctx: Context, config: Config) {
     return { id: model, provider, description: provider }
   }, () => ctx.get('prismModelRules')?.(), workspace ? {
     workspace: {projectId: 'prism-conversation', nodeId: mesh.nodeId, cwd: workspace},
+    extensions: {
+      memory: () => ctx.get('prismMemory', true) as PrismMemory | undefined,
+      triggers: () => ctx.get('prismTriggers', true) as PrismTriggers | undefined,
+    },
   } : undefined)
   ctx.on('settings/document-updated', ns => {
     if (ns === 'dsh-prism-models' || ns === 'agent-default-model') {
       core.refreshModels()
     }
   })
-  const detach = mesh.attach({ runner: local, authorize: spec => core.authorizeRemote(spec), definitionsFor: layer => toolSets[layer] })
+  const detach = mesh.attach({ runner: local, authorize: spec => core.authorizeRemote(spec), definitionsFor: layer => core.remoteDefinitions(layer) })
   const close = async () => {
     router.close()
     detach()
@@ -111,6 +115,10 @@ export async function apply(ctx: Context, config: Config) {
     }
     await core.start()
     ctx.provide('prism', core)
+    ctx.inject(['prismTriggers'], scope => {
+      const triggers = scope.get('prismTriggers', true) as PrismTriggers
+      return triggers.setSink(event => core.acceptTrigger(event))
+    })
   } catch (error) {
     await close()
     throw error

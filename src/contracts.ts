@@ -1,3 +1,5 @@
+import type {MediaAsset} from './extensions.js'
+
 export type Layer = 'L1' | 'L2' | 'L3'
 
 /** DSH 模型路由在一个棱镜层级的启用状态及自定义说明。 */
@@ -108,6 +110,7 @@ export interface PublicMessage {
   text: string
   at: string
   source?: MessageSource
+  attachments?: MediaAsset[]
 }
 
 /** 平台路由保留在宿主，模型与网页只看到发送方的展示信息。 */
@@ -135,4 +138,5 @@ export interface ConversationView {
   models: {id: string; description: string; label?: string}[]
   messages: PublicMessage[]
   tasks: TaskCard[]
+  mediaEnabled?: boolean
 }

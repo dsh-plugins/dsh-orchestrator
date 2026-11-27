@@ -3,6 +3,7 @@ import {chmodSync, existsSync, mkdirSync, rmSync} from 'node:fs'
 import {join} from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import type {Layer, MessageSource, ModelConfig, PublicMessage, ReplyRoute, TaskCard, WorkspaceTarget} from './contracts.js'
+import type {MediaAsset, Specialist} from './extensions.js'
 
 export interface Binding {
   id: string
@@ -12,6 +13,7 @@ export interface Binding {
   target: WorkspaceTarget
   ceiling: string[]
   privateWorkspace?: true
+  specialist?: Specialist
 }
 
 export interface Task extends Binding {
@@ -49,6 +51,7 @@ export interface Conversation {
   messages: (PublicMessage & {originId?: string})[]
   origins?: Record<string, RequestOrigin>
   modelChoices?: Record<string, string>
+  stagedMedia?: Record<string, Record<string, MediaAsset>>
   requests: string[]
   queue: Job[]
 }
