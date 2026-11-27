@@ -1,8 +1,21 @@
 export type Layer = 'L1' | 'L2' | 'L3'
 
+/** DSH 模型路由在一个棱镜层级的启用状态及自定义说明。 */
+export interface ModelRule {
+  provider: string
+  model: string
+  enabled: boolean
+  description: string
+  prompt: string
+}
+
+/** 每个棱镜层级独立保存的模型规则。 */
+export type ModelRules = Record<Layer, readonly ModelRule[]>
+
 export interface ModelConfig {
   id: string
   provider?: string
+  model?: string
   description: string
   prompt?: string
   promptMode?: 'append' | 'replace'
@@ -102,7 +115,7 @@ export interface TaskCard {
 
 export interface ConversationView {
   modelId: string
-  models: {id: string; description: string}[]
+  models: {id: string; description: string; label?: string}[]
   messages: PublicMessage[]
   tasks: TaskCard[]
 }

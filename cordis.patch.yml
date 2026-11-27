@@ -27,6 +27,8 @@
               sampleOverCapGlobResults: false
           - id: prism-bash
             name: '@deepseek-ai/dsh-tool-bash'
+    - id: dsh-prism-models
+      name: '@dsh-prism/dsh-orchestrator/model-settings'
     - id: dsh-orchestrator
       name: '@dsh-prism/dsh-orchestrator'
       config:
