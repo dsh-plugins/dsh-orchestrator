@@ -513,7 +513,7 @@ test('layer model rules distinguish providers and preserve accepted model and pr
   const dir = await mkdtemp(join(tmpdir(), 'prism-layer-models-'))
   t.after(() => rm(dir, {recursive:true, force:true}))
   const rule = (provider, model, prompt) => ({provider, model, enabled:true, description:provider, prompt})
-  const conversational = rule('provider-a', 'chat', '默认交互提示')
+  const conversational = {...rule('provider-a', 'chat', '默认交互提示'), description: ''}
   const selected = rule('provider-b', 'chat', '原始交互提示')
   const plan = rule('provider-a', 'planner', '规划提示')
   const otherPlan = rule('provider-b', 'planner', '备用规划提示')
@@ -559,6 +559,7 @@ test('layer model rules distinguish providers and preserve accepted model and pr
   try {
     const first = await core.view('alice')
     assert.deepEqual(first.models.map(item => item.label), ['provider-a/chat','provider-b/chat'])
+    assert.equal(first.models[0].description, 'provider-a/chat')
     assert.notEqual(first.models[0].id, first.models[1].id)
     assert.equal(first.modelId, first.models[0].id)
     await core.selectModel('alice', first.models[1].id)

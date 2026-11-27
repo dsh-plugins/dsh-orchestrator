@@ -38,7 +38,7 @@ export function permittedModels(rules: readonly ModelRule[] | undefined, fallbac
     id: routeId(rule.provider, rule.model),
     provider: rule.provider,
     model: rule.model,
-    description: rule.description,
+    description: rule.description.trim() || rule.provider + '/' + rule.model,
     ...(rule.prompt.trim() && { prompt: rule.prompt }),
   }))
   return enabled?.length ? enabled : [fallback]
