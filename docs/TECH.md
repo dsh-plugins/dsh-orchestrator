@@ -45,6 +45,8 @@ models:
 | L2 | `list_models`、`dispatch_executor`、`send_child`、`get_progress`、`send_parent`、`report_progress` | 使用 L1 指定的已授权项目。通过 `dispatch_executor` 拆分步骤，每次选择一个 L3 模型。 |
 | L3 | `send_parent`、`report_progress`，以及授权的原生工具 | 服务端从 L2 继承工作区和节点。原生工具集合取节点配置、项目策略和逐级派发授权的交集。 |
 
+L1 通过 `send_user` 即时发送消息。默认提示词要求 L1 在需要查询或执行任务时先确认收到请求，并在派发成功后简短说明已安排的工作。两条过程消息使用 `final: false`。结果齐备后，L1 使用 `final: true` 交付最终答复。用户明确只要最终结果时，L1 省略过程消息。
+
 两种派发工具都接收 `title`、`instruction`、`modelId` 和可选的 `permissions`。L1 派发还必须提供 `projectId`。返回的 `taskId` 可用于向自己的直接子任务发信、查询其进展和下属步骤。每次派发可以收窄后续任务权限。`executionTools` 可配置的原生 DSH 工具为 `read`、`read_image`、`glob`、`grep`、`write`、`edit`、`apply_patch`、`bash`，实际可用项还取决于宿主挂载的工具。启用 `bash` 会授予该执行节点配置的 shell 能力。
 
 DSH 自动发现的本机工作区使用原生工作区标识。读取和搜索工具只能访问当前工作区内实际解析到的路径。

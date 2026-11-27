@@ -509,6 +509,46 @@ test('progress messages before dispatch and between planner results do not satis
   } finally { releaseSecond.resolve(); await core.close() }
 })
 
+test('a dispatch update published after a fast planner settles does not count as the final answer', {timeout:10000}, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'prism-dispatch-receipt-'))
+  t.after(() => rm(dir, {recursive:true, force:true}))
+  const completed = Promise.withResolvers()
+  const publications = []
+  const runner = {
+    async run(_spec, raw, tools) {
+      const event = JSON.parse(raw)
+      if (event.kind === 'user') {
+        await tools.invoke('send_user', {text:'收到，我会核对项目。', final:false})
+        await tools.invoke('dispatch_planner', {projectId:'lobby', modelId:'flash', title:'核对项目', instruction:'查明项目用途'})
+        await completed.promise
+        await tools.invoke('send_user', {text:'已安排核对。', final:false})
+      } else if (event.kind === 'assignment') {
+        await tools.invoke('send_parent', {text:'接待台用于访客登记。', final:true})
+      } else if (event.kind === 'finalize_response') {
+        await assert.rejects(tools.invoke('send_user', {text:'仍在核对。', final:false}), /最终答复/)
+        await tools.invoke('send_user', {text:event.tasks[0].result, final:true})
+      }
+    },
+    async transcript() { return [] },
+  }
+  const core = new Orchestrator({useHostModel:true}, registry, runner, dir, () => model('flash'))
+  const unsubscribe = core.subscribe('alice', snapshot => {
+    if (snapshot.tasks[0]?.status === 'completed') completed.resolve()
+    publications.push({task: snapshot.tasks[0]?.status, replies: snapshot.messages.slice(1).map(message => message.text)})
+  })
+  try {
+    await core.start()
+    await core.message('alice', '项目是做什么的？', 'fast-planner')
+    await core.whenIdle()
+    const replies = ['收到，我会核对项目。', '已安排核对。', '接待台用于访客登记。']
+    assert.ok(publications.some(item => !item.task && item.replies.length === 1 && item.replies[0] === replies[0]))
+    assert.ok(publications.some(item => item.task === 'completed' && item.replies.length === 2 && item.replies[1] === replies[1]))
+    const view = await core.view('alice')
+    assert.equal(view.messages[0].delivery, 'processed')
+    assert.deepEqual(view.messages.slice(1).map(message => message.text), replies)
+  } finally { unsubscribe(); completed.resolve(); await core.close() }
+})
+
 test('layer model rules distinguish providers and preserve accepted model and prompt snapshots', {timeout:10000}, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'prism-layer-models-'))
   t.after(() => rm(dir, {recursive:true, force:true}))

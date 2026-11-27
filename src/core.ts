@@ -339,7 +339,7 @@ export class Orchestrator {
               const reply = job.originId && state.awaitingReplies?.[job.originId]
               if (!reply || reply.delivered) return {sent: true}
             }
-            return this.invoke(owner, state, actor.id, name, args, job.originId)
+            return this.invoke(owner, state, actor.id, name, args, job)
           })
           this.publish(owner)
           this.wake(owner)
@@ -404,7 +404,7 @@ export class Orchestrator {
     })
     return JSON.stringify({
       kind: 'finalize_response',
-      instruction: 'The delegated work has finished. Its final answer has not been delivered to the user. Call the send_user tool now, using the language and format of the specific user request below. Ordinary text is private and never delivered. Use these task results as evidence, sharing only the requested facts. If evidence is missing, explicitly send that limitation.',
+      instruction: 'The delegated work has finished. Its final answer has not been delivered to the user. Call the send_user tool now with final=true, using the language and format of the specific user request below. Ordinary text is private and never delivered. Use these task results as evidence, sharing only the requested facts. If evidence is missing, explicitly send that limitation.',
       userRequest: original.text, tasks,
     })
   }
@@ -422,7 +422,8 @@ export class Orchestrator {
     }), undefined, originId)
   }
 
-  private invoke(owner: string, state: Conversation, id: string, name: string, raw: unknown, originId?: string): unknown {
+  private invoke(owner: string, state: Conversation, id: string, name: string, raw: unknown, job: Job): unknown {
+    const {originId, deliveryOnly} = job
     const actor = binding(state, id)
     resolveBinding(this.registry, owner, actor.target)
     const definition = toolSets[actor.layer].find(tool => tool.name === name)
@@ -435,9 +436,13 @@ export class Orchestrator {
     }
     switch (name) {
       case 'send_user': {
+        if (args.final !== undefined && typeof args.final !== 'boolean') throw new PrismError('INVALID_INPUT', 'final 必须为布尔值')
+        if (deliveryOnly && args.final === false) throw new PrismError('INVALID_INPUT', '本轮需要发送最终答复')
         state.messages.push({id: randomUUID(), role: 'assistant', text: textField(args.text), at: now()})
         const reply = originId && state.awaitingReplies?.[originId]
-        if (reply) reply.delivered = !state.tasks.some(task => reply.plannerIds.includes(task.id) && !terminal(task))
+        if (reply && args.final !== false) {
+          reply.delivered = !state.tasks.some(task => reply.plannerIds.includes(task.id) && !terminal(task))
+        }
         return {sent: true}
       }
       case 'query_projects': {
