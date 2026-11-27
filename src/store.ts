@@ -38,7 +38,7 @@ export interface Job {
 export interface Conversation {
   root: Binding
   previousRoots?: Binding[]
-  awaitingReplies?: Record<string, {rootId: string; plannerIds: string[]; delivered?: boolean}>
+  awaitingReplies?: Record<string, {rootId: string; plannerIds: string[]; delivered?: boolean; hostModel?: ModelConfig}>
   tasks: Task[]
   messages: PublicMessage[]
   requests: string[]
@@ -46,7 +46,11 @@ export interface Conversation {
 }
 
 export function enqueue(state: Conversation, target: Binding, text: string, messageId?: string, originId?: string): Job {
-  const job: Job = {id: randomUUID(), bindingId: target.id, modelId: target.modelId, hostModel: target.hostModel, text, messageId, originId}
+  const requestModel = target.layer === 'L1' && originId ? state.awaitingReplies?.[originId]?.hostModel : undefined
+  const job: Job = {
+    id: randomUUID(), bindingId: target.id, modelId: requestModel?.id ?? target.modelId,
+    hostModel: requestModel ?? target.hostModel, text, messageId, originId,
+  }
   state.queue.push(job)
   return job
 }

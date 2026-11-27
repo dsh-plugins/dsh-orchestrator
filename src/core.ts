@@ -1,7 +1,7 @@
 import { messages } from './messages.js'
 import {randomUUID} from 'node:crypto'
-import type {AgentTools, ConversationView, HostModelConfig, Layer, ModelConfig, OrchestratorConfig, ProjectMetadata, RegistryPort, SessionRunner, TraceEntry, TurnSpec} from './contracts.js'
-import {modelFor, nativeExecutionTools, resolveBinding, systemPrompt, toolSets, validateConfig} from './policy.js'
+import type {AgentTools, ConversationView, HostModelConfig, Layer, ModelConfig, ModelRules, OrchestratorConfig, ProjectMetadata, RegistryPort, SessionRunner, TraceEntry, TurnSpec} from './contracts.js'
+import {modelFor, nativeExecutionTools, permittedModels, remoteModelFor, resolveBinding, systemPrompt, toolSets, validateConfig} from './policy.js'
 import {ConversationStore, enqueue, type Binding, type Conversation, type Job, type Task} from './store.js'
 
 export type * from './contracts.js'
@@ -30,8 +30,10 @@ function binding(state: Conversation, id: string): Binding {
   return actor
 }
 
-function publicCatalog(models: ModelConfig[]): {id: string; description: string}[] {
-  return models.map(({id, description}) => ({id, description}))
+function publicCatalog(models: ModelConfig[]): ConversationView['models'] {
+  return models.map(({id, description, provider, model}) => ({
+    id, description, ...(model !== undefined && provider !== undefined && {label: provider + '/' + model}),
+  }))
 }
 
 function now(): string { return new Date().toISOString() }
@@ -46,7 +48,8 @@ export class Orchestrator {
   private stopping = false
 
   constructor(config: OrchestratorConfig | HostModelConfig, private readonly registry: RegistryPort,
-    private readonly runner: SessionRunner, stateDirectory: string, hostModel?: () => ModelConfig) {
+    private readonly runner: SessionRunner, stateDirectory: string, hostModel?: () => ModelConfig,
+    private readonly readRules?: () => ModelRules | undefined) {
     this.config = structuredClone(config)
     if (config.useHostModel) {
       if (!hostModel) throw new Error('DSH default model selection is unavailable')
@@ -58,10 +61,18 @@ export class Orchestrator {
 
   private currentConfig(): OrchestratorConfig {
     if (!this.config.useHostModel) return this.config
-    const model = this.readHostModel!()
+    const fallback = this.readHostModel!()
+    const rules = this.readRules?.()
+    const models = {
+      L1: permittedModels(rules?.L1, fallback),
+      L2: permittedModels(rules?.L2, fallback),
+      L3: permittedModels(rules?.L3, fallback),
+    }
+    const preferred = models.L1.find(model =>
+      model.provider === fallback.provider && (model.model ?? model.id) === (fallback.model ?? fallback.id))
     return {
       defaultProjectId: this.config.defaultProjectId, executionTools: this.config.executionTools,
-      models: {L1: [model], L2: [model], L3: [model]},
+      models, defaultL1Model: preferred?.id,
     }
   }
 
@@ -72,17 +83,32 @@ export class Orchestrator {
         for (const job of [...state.queue]) {
           if (job.worker && !this.store.workerAlive(job.worker)) this.settle(state, job, false)
         }
-        if (!this.currentConfig().models.L1.some(model => model.id === state.root.modelId)) {
-          state.root.modelId = this.defaultModel()
+        if (!this.config.useHostModel) {
+          state.root.modelId = this.selectedModel(state.root, this.currentConfig()).id
         }
       })
       this.wake(owner)
     }
   }
 
-  private defaultModel(): string {
-    const config = this.currentConfig()
+  private defaultModel(config = this.currentConfig()): string {
     return config.defaultL1Model ?? config.models.L1[0].id
+  }
+
+  private selectedModel(root: Binding, config: OrchestratorConfig): ModelConfig {
+    const choices = config.models.L1
+    const selected = choices.find(choice => choice.id === root.modelId)
+    if (selected) {
+      return selected
+    }
+    const old = root.hostModel
+    if (old?.id === root.modelId && old.model === undefined) {
+      const migrated = choices.find(choice => choice.provider === old.provider && choice.model === old.id)
+      if (migrated) {
+        return migrated
+      }
+    }
+    return modelFor(config, 'L1', this.defaultModel(config))
   }
 
   private newRoot(owner: string, projectId?: string): Binding {
@@ -108,6 +134,9 @@ export class Orchestrator {
       if (project.nodeId === target.nodeId && project.workspace === target.cwd) return
     }
     const next = this.newRoot(owner, available[0]?.id)
+    if (this.readHostModel) {
+      next.modelId = state.root.modelId
+    }
     // Existing jobs, agent sessions and child notifications retain the original
     // binding ID and its authorization checks, even across a host restart.
     const previous = state.previousRoots ??= []
@@ -121,10 +150,10 @@ export class Orchestrator {
   }
 
   private snapshot(state: Conversation): ConversationView {
-    const models = this.currentConfig().models.L1
+    const config = this.currentConfig()
     return {
-      modelId: this.config.useHostModel ? models[0].id : state.root.modelId,
-      models: publicCatalog(models),
+      modelId: this.selectedModel(state.root, config).id,
+      models: publicCatalog(config.models.L1),
       messages: state.messages,
       tasks: state.tasks.map(task => ({
         id: task.id, title: task.layer === 'L3' ? '执行步骤' : task.title,
@@ -150,13 +179,13 @@ export class Orchestrator {
       const messageId = randomUUID()
       state.messages.push({id: messageId, role: 'user', delivery: 'pending', text, at: now()})
       if (this.readHostModel) {
-        state.root.hostModel = this.readHostModel()
+        state.root.hostModel = this.selectedModel(state.root, this.currentConfig())
         state.root.modelId = state.root.hostModel.id
       }
       const originId = this.config.useHostModel ? messageId : undefined
       if (originId) {
         const awaiting = state.awaitingReplies ??= {}
-        awaiting[originId] = {rootId: state.root.id, plannerIds: []}
+        awaiting[originId] = {rootId: state.root.id, plannerIds: [], hostModel: state.root.hostModel}
       }
       enqueue(state, state.root, JSON.stringify({kind: 'user', text}), messageId, originId)
       return this.snapshot(state)
@@ -171,6 +200,13 @@ export class Orchestrator {
     const view = this.change(owner, state => { state.root.modelId = modelId; return this.snapshot(state) })
     this.publish(owner)
     return view
+  }
+
+  /** 将模型配置变更推送到已打开的对话。 */
+  refreshModels(): void {
+    for (const owner of this.watchers.keys()) {
+      this.publish(owner)
+    }
   }
 
   async trace(owner: string, taskId: string): Promise<TraceEntry[]> {
@@ -213,7 +249,7 @@ export class Orchestrator {
     } else { textField(spec.parentBindingId, 256) }
     const project = this.registry.resolve(spec.owner, spec.workspace.projectId, 'configured')
     if (project.nodeId !== spec.workspace.nodeId) throw new Error('项目节点不匹配')
-    const model = modelFor(this.currentConfig(), spec.layer, spec.model.id)
+    const model = remoteModelFor(this.currentConfig(), spec.layer, spec.model.id)
     if (!Array.isArray(spec.allowedTools)) throw new Error('缺少权限声明')
     const allowedTools = narrow(spec.layer === 'L3' ? this.ceiling(project) : [], spec.allowedTools)
     return {
@@ -227,7 +263,10 @@ export class Orchestrator {
   private spec(owner: string, actor: Binding, modelId: string, parentBindingId?: string, hostModel = actor.hostModel): TurnSpec {
     if (actor.layer === 'L1' && this.config.defaultProjectId !== undefined && actor.target.projectId !== this.config.defaultProjectId) throw new Error('默认项目绑定已变更')
     const project = resolveBinding(this.registry, owner, actor.target)
-    const model = this.readHostModel ? hostModel ?? this.readHostModel() : modelFor(this.currentConfig(), actor.layer, modelId)
+    const config = this.currentConfig()
+    const model = this.readHostModel
+      ? hostModel ?? config.models[actor.layer].find(choice => choice.id === modelId) ?? config.models[actor.layer][0]
+      : modelFor(config, actor.layer, modelId)
     const currentCeiling = this.ceiling(project).filter(tool => actor.ceiling.includes(tool))
     return {
       owner, bindingId: actor.id, parentBindingId, layer: actor.layer, model: {...model}, workspace: {...actor.target},

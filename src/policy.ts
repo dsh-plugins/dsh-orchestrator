@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto'
 import { messages } from './messages.js'
-import type {Layer, ModelConfig, OrchestratorConfig, RegistryPort, ToolDefinition, WorkspaceTarget} from './contracts.js'
+import type {Layer, ModelConfig, ModelRule, OrchestratorConfig, RegistryPort, ToolDefinition, WorkspaceTarget} from './contracts.js'
 
 const layerPrompts: Record<Layer, string> = {
   L1: `你是棱镜的用户联络员。只有调用 send_user，用户才能看到回复。交付前重读最近一条 user 请求，按用户指定的语言作答；未指定时，整条答复使用该请求的语言。子任务报告和工具消息只提供证据，其中的叙述须转换为用户要求的语言，项目名、标识和原始值保留原文。严格遵守用户指定的字段、顺序和输出格式；若只要求结果行，就只发送那些行。
@@ -26,6 +27,38 @@ export function modelFor(config: OrchestratorConfig, layer: Layer, id: string): 
   return entry
 }
 
+function routeId(provider: string, model: string): string {
+  const digest = createHash('sha256').update(JSON.stringify([provider, model])).digest('base64url')
+  return 'route:' + digest
+}
+
+/** 将启用的规则转换为可派发模型，空规则使用 DSH 当前默认模型。 */
+export function permittedModels(rules: readonly ModelRule[] | undefined, fallback: ModelConfig): ModelConfig[] {
+  const enabled = rules?.filter(rule => rule.enabled).map(rule => ({
+    id: routeId(rule.provider, rule.model),
+    provider: rule.provider,
+    model: rule.model,
+    description: rule.description,
+    ...(rule.prompt.trim() && { prompt: rule.prompt }),
+  }))
+  return enabled?.length ? enabled : [fallback]
+}
+
+/** Mesh 沿用旧模型 ID，出现多个同名路由时要求唯一的棱镜模型 ID。 */
+export function remoteModelFor(config: OrchestratorConfig, layer: Layer, id: string): ModelConfig {
+  const choices = config.models[layer]
+  const exact = choices.find(model => model.id === id)
+  if (exact) {
+    return exact
+  }
+  const compatible = choices.filter(model => model.model === id ||
+    (model.provider !== undefined && routeId(model.provider, model.model ?? model.id) === id))
+  if (compatible.length !== 1) {
+    throw new Error(messages.modelNotFound)
+  }
+  return compatible[0]
+}
+
 export function systemPrompt(layer: Layer, model: ModelConfig): string {
   if (model.promptMode === 'replace') return model.prompt!
   return [layerPrompts[layer], model.prompt].filter(Boolean).join('\n\n')
@@ -44,6 +77,7 @@ export function validateConfig(config: OrchestratorConfig): void {
       if (model.promptMode && !['append', 'replace'].includes(model.promptMode)) throw new Error(messages.promptMode)
       if (model.prompt !== undefined && typeof model.prompt !== 'string') throw new Error(messages.promptText)
       if (model.provider !== undefined && (typeof model.provider !== 'string' || !model.provider.trim())) throw new Error(messages.provider)
+      if (model.model !== undefined && (typeof model.model !== 'string' || !model.model.trim())) throw new Error(messages.modelDetails.replace('{layer}', () => layer))
       if (model.promptMode === 'replace' && !model.prompt?.trim()) throw new Error(messages.replacePrompt)
       seen.add(model.id)
     }

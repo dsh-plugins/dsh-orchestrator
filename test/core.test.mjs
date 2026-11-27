@@ -508,3 +508,93 @@ test('progress messages before dispatch and between planner results do not satis
     ])
   } finally { releaseSecond.resolve(); await core.close() }
 })
+
+test('layer model rules distinguish providers and preserve accepted model and prompt snapshots', {timeout:10000}, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'prism-layer-models-'))
+  t.after(() => rm(dir, {recursive:true, force:true}))
+  const rule = (provider, model, prompt) => ({provider, model, enabled:true, description:provider, prompt})
+  const conversational = rule('provider-a', 'chat', '默认交互提示')
+  const selected = rule('provider-b', 'chat', '原始交互提示')
+  const plan = rule('provider-a', 'planner', '规划提示')
+  const otherPlan = rule('provider-b', 'planner', '备用规划提示')
+  const execution = rule('provider-c', 'worker', '执行提示')
+  let rules = {L1:[conversational, selected], L2:[plan, otherPlan], L3:[execution]}
+  const started = Promise.withResolvers()
+  const resume = Promise.withResolvers()
+  const turns = []
+  const failures = []
+  const runner = {
+    async run(spec, input, tools) {
+      const event = JSON.parse(input)
+      turns.push({spec,event})
+      try {
+        if (event.kind === 'user' && event.text === 'wait') {
+          started.resolve()
+          await resume.promise
+        } else if (event.kind === 'user') {
+          const options = await tools.invoke('list_models', {})
+          assert.deepEqual(options.map(option => option.label), ['provider-a/planner','provider-b/planner'])
+          await tools.invoke('dispatch_planner', {
+            projectId:'lobby', modelId:options[0].id, title:'plan', instruction:'inspect'
+          })
+        } else if (event.kind === 'assignment' && spec.layer === 'L2') {
+          const options = await tools.invoke('list_models', {})
+          assert.equal(options[0].label, 'provider-c/worker')
+          await tools.invoke('dispatch_executor', {modelId:options[0].id, title:'work', instruction:'execute'})
+        } else if (spec.layer === 'L3' || (event.kind === 'task_settled' && spec.layer === 'L2')) {
+          await tools.invoke('send_parent', {text:'done', final:true})
+        } else if (event.kind === 'task_settled' || event.kind === 'finalize_response') {
+          await tools.invoke('send_user', {text:'complete'})
+        }
+      } catch (error) {
+        failures.push(error)
+        throw error
+      }
+    },
+    async transcript() { return [] },
+  }
+  const open = () => new Orchestrator({useHostModel:true}, registry, runner, dir,
+    () => ({id:'chat',provider:'provider-a',description:'DSH default'}), () => rules)
+  let core = open()
+  try {
+    const first = await core.view('alice')
+    assert.deepEqual(first.models.map(item => item.label), ['provider-a/chat','provider-b/chat'])
+    assert.notEqual(first.models[0].id, first.models[1].id)
+    assert.equal(first.modelId, first.models[0].id)
+    await core.selectModel('alice', first.models[1].id)
+    await core.close()
+    core = open()
+    await core.start()
+    assert.equal((await core.view('alice')).modelId, first.models[1].id)
+
+    await core.message('alice', 'wait')
+    await started.promise
+    await core.message('alice', 'delegate')
+    rules = {...rules, L1:[conversational, {...selected, enabled:false, prompt:'更新后的提示'}]}
+    assert.equal((await core.view('alice')).modelId, first.models[0].id)
+    await assert.rejects(core.selectModel('alice', first.models[1].id), {code:'INVALID_INPUT'})
+    resume.resolve()
+    await core.whenIdle()
+    if (failures.length) throw failures[0]
+
+    const planner = turns.find(turn => turn.spec.layer === 'L2').spec
+    const executor = turns.find(turn => turn.spec.layer === 'L3').spec
+    assert.equal(planner.model.model,'planner')
+    assert.equal(executor.model.model,'worker')
+    assert.match(planner.systemPrompt,/规划提示/)
+    assert.match(executor.systemPrompt,/执行提示/)
+    assert.equal(core.authorizeRemote(planner).model.provider,'provider-a')
+    assert.throws(() => core.authorizeRemote({...planner,model:{id:'planner'}}))
+    for (const {spec} of turns.filter(turn => turn.spec.layer === 'L1')) {
+      assert.equal(spec.model.provider,'provider-b')
+      assert.match(spec.systemPrompt,/原始交互提示/)
+      assert.doesNotMatch(spec.systemPrompt,/更新后的提示/)
+    }
+
+    rules = {L1:[], L2:[], L3:[]}
+    assert.equal((await core.view('alice')).modelId, 'chat')
+  } finally {
+    resume.resolve()
+    await core.close()
+  }
+})

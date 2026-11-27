@@ -7,6 +7,7 @@ import { Orchestrator } from './core.js'
 import { DshSessionRunner } from './host.js'
 import { PrismProvider, ProviderRouter } from './provider.js'
 import { toolSets } from './policy.js'
+import type {} from './model-settings.js'
 
 export * from './core.js'
 export * from './contracts.js'
@@ -45,6 +46,11 @@ export async function apply(ctx: Context, config: Config) {
   const core = new Orchestrator(config, ctx.prismRegistry, router, directory, () => {
     const { provider, model } = ctx.agentDefaultModel.currentSelection()
     return { id: model, provider, description: provider }
+  }, () => ctx.get('prismModelRules')?.())
+  ctx.on('settings/document-updated', ns => {
+    if (ns === 'dsh-prism-models' || ns === 'agent-default-model') {
+      core.refreshModels()
+    }
   })
   const detach = mesh.attach({ runner: local, authorize: spec => core.authorizeRemote(spec), definitionsFor: layer => toolSets[layer] })
   const close = async () => {
