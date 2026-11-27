@@ -32,9 +32,13 @@ export interface ProjectMetadata {
   permissions: string[]
 }
 
+/** 查询会话的可见项目，Mesh 入站派发仅解析显式配置的项目。 */
 export interface RegistryPort {
   query(owner: string, search?: string): ProjectMetadata[]
-  resolve(owner: string, projectId: string): ProjectMetadata & {workspace: string}
+  resolve(owner: string, projectId: string, source?: 'configured'): ProjectMetadata & {
+    workspace: string
+    workspaceId?: string
+  }
 }
 
 export interface WorkspaceTarget {

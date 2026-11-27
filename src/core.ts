@@ -211,7 +211,7 @@ export class Orchestrator {
     if (spec.layer === 'L1') {
       if (spec.parentBindingId !== undefined || (this.config.defaultProjectId !== undefined && spec.workspace.projectId !== this.config.defaultProjectId)) throw new Error('交互会话必须绑定默认项目')
     } else { textField(spec.parentBindingId, 256) }
-    const project = this.registry.resolve(spec.owner, spec.workspace.projectId)
+    const project = this.registry.resolve(spec.owner, spec.workspace.projectId, 'configured')
     if (project.nodeId !== spec.workspace.nodeId) throw new Error('项目节点不匹配')
     const model = modelFor(this.currentConfig(), spec.layer, spec.model.id)
     if (!Array.isArray(spec.allowedTools)) throw new Error('缺少权限声明')

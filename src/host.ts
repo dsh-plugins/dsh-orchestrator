@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto'
+import { realpathSync } from 'node:fs'
+import { realpath } from 'node:fs/promises'
+import { isAbsolute, relative, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentSetup, CreateAgentOptions } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
@@ -9,7 +12,7 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionAlreadyOwnedError } from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-session-query'
 import { NativeToolExecutor } from '@deepseek-ai/dsh-tool-executor-native'
-import type {} from '@deepseek-ai/dsh-workspace'
+import { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import type { AgentTools, RegistryPort, SessionRunner, TraceEntry, TurnSpec } from './contracts.js'
 import { SessionBindings } from './host-bindings.js'
 import { resolveBinding } from './policy.js'
@@ -26,6 +29,14 @@ function trace(events: readonly SessionEvent[]): TraceEntry[] {
     }
   }
   return entries
+}
+
+function withinWorkspace(workspace: string, path: string): boolean {
+  if (realpathSync(workspace) !== workspace) {
+    return false
+  }
+  const target = relative(workspace, realpathSync(resolve(workspace, path)))
+  return target !== '..' && !target.startsWith('..' + sep) && !isAbsolute(target)
 }
 
 export class DshSessionRunner implements SessionRunner {
@@ -82,7 +93,18 @@ export class DshSessionRunner implements SessionRunner {
           if (this.registry) {
             try {
               const project = resolveBinding(this.registry, spec.owner, spec.workspace)
-              if (native.includes(exec.name) && !project.permissions.includes(exec.name)) return 'Project tool permission was revoked'
+              if (native.includes(exec.name)) {
+                if (!project.permissions.includes(exec.name)) {
+                  return 'Project tool permission was revoked'
+                }
+                if (project.workspaceId !== undefined) {
+                  const args = exec.arguments as { file_path?: unknown; path?: unknown } | null
+                  const target = exec.name === 'read' ? args?.file_path : (args?.path ?? '.')
+                  if (typeof target !== 'string' || !withinWorkspace(project.workspace, target)) {
+                    return 'The requested path is outside the registered DSH workspace'
+                  }
+                }
+              }
             } catch {
               return 'Project access was revoked or the workspace moved'
             }
@@ -145,7 +167,20 @@ export class DshSessionRunner implements SessionRunner {
 
   private async activate(spec: TurnSpec, tools: AgentTools, signal: AbortSignal): Promise<AgentHandle> {
     const setup = this.setup(spec, tools)
-    const workspace = await this.ctx.workspaceRegistry.create(spec.workspace.cwd)
+    const workspaceId = this.registry && resolveBinding(this.registry, spec.owner, spec.workspace).workspaceId
+    const workspaces = this.ctx.workspaceRegistry
+    const workspace = workspaceId === undefined
+      ? await workspaces.create(spec.workspace.cwd)
+      : workspaces.get(WorkspaceId(workspaceId))
+    if (!workspace) {
+      throw new Error('会话绑定的 DSH 工作区已移除')
+    }
+    if (workspaceId !== undefined) {
+      const [status, canonicalPath] = await Promise.all([workspace.status(), realpath(workspace.path)])
+      if (status !== 'ok' || canonicalPath !== workspace.path) {
+        throw new Error('会话绑定的 DSH 工作区已变更')
+      }
+    }
     const parentSession = this.bindings.parent(spec)
     for (;;) {
       signal.throwIfAborted()
