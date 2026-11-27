@@ -11,6 +11,7 @@ const plugin = (id, config) => ({ id, name: join(root, id, 'dist', 'index.js'), 
 export function makePatch(config, directory = root) {
   const mesh = config.mesh ?? { nodeId: 'local' }
   const registry = structuredClone(config.registry)
+  registry.useHostWorkspaces ??= false
   for (const entry of registry.projects ?? []) {
     if (entry.nodeId === mesh.nodeId) entry.workspace = resolve(directory, entry.workspace)
     else if (!isAbsolute(entry.workspace)) throw new Error('远程项目需要指定节点上的绝对路径')
