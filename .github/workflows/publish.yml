@@ -25,12 +25,14 @@ jobs:
       - run: npm test
       - name: Pack the tested package
         run: |
+          npm pkg set "gitHead=$GITHUB_SHA"
           mkdir "$RUNNER_TEMP/npm-package"
           npm pack --pack-destination "$RUNNER_TEMP/npm-package"
           mv "$RUNNER_TEMP"/npm-package/*.tgz "$RUNNER_TEMP/release.tgz"
           tar -xzf "$RUNNER_TEMP/release.tgz" -C "$RUNNER_TEMP/npm-package"
           cd "$RUNNER_TEMP/npm-package/package"
           node -e "require('node:fs').accessSync(require('./package.json').dsh.bundle.patch)"
+          test "$GITHUB_SHA" = "$(node -p 'require("./package.json").gitHead')"
       - uses: actions/upload-artifact@v6
         with:
           name: npm-package
