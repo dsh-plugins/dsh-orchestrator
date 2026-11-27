@@ -473,6 +473,7 @@ test('progress messages before dispatch and between planner results do not satis
   t.after(() => rm(dir, {recursive:true, force:true}))
   const releaseSecond = Promise.withResolvers()
   const deliveryTurns = []
+  let partial
   const runner = {
     async run(_spec, raw, tools) {
       const event = JSON.parse(raw)
@@ -485,7 +486,8 @@ test('progress messages before dispatch and between planner results do not satis
         if (event.projectId === 'invoice') await releaseSecond.promise
         await tools.invoke('send_parent', {text:event.projectId + ' evidence', final:true})
       } else if (event.kind === 'task_settled' && event.projectId === 'lobby') {
-        await tools.invoke('send_user', {text:'One of the two projects has reported.'})
+        await tools.invoke('send_user', {text:'One of the two projects has reported.', final:false})
+        partial = await core.view('alice')
         releaseSecond.resolve()
       } else if (event.kind === 'finalize_response') {
         deliveryTurns.push(event)
@@ -501,6 +503,8 @@ test('progress messages before dispatch and between planner results do not satis
     await core.whenIdle()
     assert.equal(deliveryTurns.length, 1)
     assert.deepEqual(deliveryTurns[0].tasks.map(task => task.result).sort(), ['invoice evidence','lobby evidence'])
+    assert.equal(partial.messages.at(-1).text, 'One of the two projects has reported.')
+    assert.equal(partial.tasks.find(task => task.title === 'invoice').status, 'running')
     const view = await core.view('alice')
     assert.equal(view.messages[0].delivery, 'processed')
     assert.deepEqual(view.messages.map(m => m.text), [
