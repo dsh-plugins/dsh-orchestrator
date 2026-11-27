@@ -1,7 +1,7 @@
 {
   "name": "@dsh-prism/dsh-orchestrator",
   "description": "Coordinate Prism conversations, project planners and task executors across workspaces.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
