@@ -4,19 +4,35 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing stable tag to publish. Leave blank for a build check.
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: npm-release-${{ github.ref }}
+  group: npm-release-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
     steps:
+      - name: Validate the requested tag
+        if: env.RELEASE_TAG != ''
+        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+          persist-credentials: false
       - uses: actions/setup-node@v6.4.0
         with:
           node-version: '24'
@@ -25,35 +41,17 @@ jobs:
       - run: npm test
       - name: Pack the tested package
         run: |
-          npm pkg set "gitHead=$GITHUB_SHA"
+          commit="$(git rev-parse HEAD)"
+          npm pkg set "gitHead=$commit"
           mkdir "$RUNNER_TEMP/npm-package"
           npm pack --pack-destination "$RUNNER_TEMP/npm-package"
           mv "$RUNNER_TEMP"/npm-package/*.tgz "$RUNNER_TEMP/release.tgz"
           tar -xzf "$RUNNER_TEMP/release.tgz" -C "$RUNNER_TEMP/npm-package"
           cd "$RUNNER_TEMP/npm-package/package"
           node -e "require('node:fs').accessSync(require('./package.json').dsh.bundle.patch)"
-          test "$GITHUB_SHA" = "$(node -p 'require("./package.json").gitHead')"
-      - uses: actions/upload-artifact@v6
-        with:
-          name: npm-package
-          path: ${{ runner.temp }}/release.tgz
-          if-no-files-found: error
-
-  publish:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v7
-        with:
-          name: npm-package
-      - uses: actions/setup-node@v6.4.0
-        with:
-          node-version: '24'
-      - name: Verify the release tag
+          test "$commit" = "$(node -p 'require("./package.json").gitHead')"
+      - name: Publish the tested stable tag
+        if: env.RELEASE_TAG != ''
         run: |
-          tar -xOf release.tgz package/package.json > package.json
-          test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
-      - run: npm publish release.tgz --access public --registry https://registry.npmjs.org
+          test "$RELEASE_TAG" = "v$(node -p "require(process.env.RUNNER_TEMP + '/npm-package/package/package.json').version")"
+          npm publish "$RUNNER_TEMP/release.tgz" --access public --registry https://registry.npmjs.org
