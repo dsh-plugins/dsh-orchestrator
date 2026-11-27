@@ -8,5 +8,6 @@ for (const dir of ['test', ...workspaces.flatMap(base => [base + '/test', base +
     if (/\.test\.m?js$/.test(file)) files.push(dir + '/' + file)
   }
 }
-const result = spawnSync(process.execPath, ['--test', ...files], { stdio: 'inherit' })
+const testArgs = process.platform === 'win32' ? ['--test', '--test-concurrency=1'] : ['--test']
+const result = spawnSync(process.execPath, [...testArgs, ...files], { stdio: 'inherit' })
 process.exitCode = result.status ?? 1

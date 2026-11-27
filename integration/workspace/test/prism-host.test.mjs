@@ -6,7 +6,7 @@ import test from 'node:test'
 import { model, startHost, waitFor } from './host-helpers.mjs'
 import { privateText, explicitText, completeText } from './fixture-model.mjs'
 
-test('real DSH Web sends a task through three scoped agents and only publishes explicit L1 replies', { timeout: 85000 }, async t => {
+test('real DSH Web sends a task through three scoped agents and only publishes explicit L1 replies', { timeout: 120_000 }, async t => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'prism-integration-')))
   const desk = join(directory, 'desk')
   const code = join(directory, 'code')

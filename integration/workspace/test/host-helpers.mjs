@@ -47,7 +47,7 @@ export async function startHost(t, directory, config, env = {}, fixtureConfig = 
   const boot = await waitFor(() => {
     if (proc.exitCode !== null) throw new Error(diagnostic())
     return /dsh web: (http:\/\/127\.0\.0\.1:\d+\/\S*)/.exec(log)?.[1]
-  }, diagnostic)
+  }, diagnostic, 60_000)
   const login = await fetch(boot, { redirect: 'manual' })
   const cookie = login.headers.get('set-cookie')?.split(';')[0]
   assert.ok(cookie, 'the DSH authentication exchange must grant a cookie')

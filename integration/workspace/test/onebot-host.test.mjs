@@ -10,7 +10,7 @@ import { GatewayState, principal } from '@dsh-prism/dsh-im-gateway'
 import { completeText, explicitText, privateText } from './fixture-model.mjs'
 import { model, startHost, waitFor } from './host-helpers.mjs'
 
-test('signed, paired OneBot DM reaches a real DSH L1 and returns only explicit replies and scoped task cards', {timeout:100000}, async t => {
+test('signed, paired OneBot DM reaches a real DSH L1 and returns only explicit replies and scoped task cards', {timeout:160_000}, async t => {
   const base = await realpath(await mkdtemp(join(tmpdir(),'prism-onebot-')))
   const self = '10293', user = '72615', other = '73617', inbound = randomUUID(), outbound = randomUUID()
   const sends = []

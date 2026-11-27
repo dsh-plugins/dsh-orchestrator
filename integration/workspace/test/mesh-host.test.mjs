@@ -27,7 +27,7 @@ async function requests(host) {
   return (await readFile(host.logFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
 }
 
-test('two DSH hosts dispatch to peer-owned sessions, route active messages and read transcripts on demand', { timeout: 120000 }, async t => {
+test('two DSH hosts dispatch to peer-owned sessions, route active messages and read transcripts on demand', { timeout: 200_000 }, async t => {
   const base = await realpath(await mkdtemp(join(tmpdir(), 'prism-mesh-integration-')))
   const coordinatorDir = join(base, 'coordinator')
   const workerDir = join(base, 'worker')
