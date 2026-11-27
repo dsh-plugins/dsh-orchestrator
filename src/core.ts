@@ -91,7 +91,7 @@ export class Orchestrator {
     }
   }
 
-  /** 读取本机 Web 所有者已经绑定到工作区的交互历史。 */
+  /** 读取本机网页所有者已绑定到工作区的交互及子任务历史。 */
   localWorkspaceSessions(nodeId: string): TurnSpec[] {
     const owner = 'web:owner'
     const state = this.store.read(owner)
@@ -99,12 +99,14 @@ export class Orchestrator {
       return []
     }
     const config = this.currentConfig()
-    return [...(state.previousRoots ?? []), state.root].flatMap(root => {
-      if (root.target.nodeId !== nodeId) {
+    const actors: (Binding | Task)[] = [...(state.previousRoots ?? []), state.root, ...state.tasks]
+    return actors.flatMap(actor => {
+      if (actor.target.nodeId !== nodeId) {
         return []
       }
       try {
-        return [this.spec(owner, root, this.selectedModel(root, config).id)]
+        const modelId = actor.layer === 'L1' ? this.selectedModel(actor, config).id : actor.modelId
+        return [this.spec(owner, actor, modelId, 'parent' in actor ? actor.parent : undefined)]
       } catch (error) {
         if (error instanceof Error) {
           console.warn('[dsh-prism] 无法恢复旧工作区会话', error.message)
@@ -284,7 +286,7 @@ export class Orchestrator {
     }
   }
 
-  private spec(owner: string, actor: Binding, modelId: string, parentBindingId?: string, hostModel = actor.hostModel): TurnSpec {
+  private spec(owner: string, actor: Binding | Task, modelId: string, parentBindingId?: string, hostModel = actor.hostModel): TurnSpec {
     if (actor.layer === 'L1' && this.config.defaultProjectId !== undefined && actor.target.projectId !== this.config.defaultProjectId) throw new Error('默认项目绑定已变更')
     const project = resolveBinding(this.registry, owner, actor.target)
     const config = this.currentConfig()
@@ -294,7 +296,9 @@ export class Orchestrator {
     const currentCeiling = this.ceiling(project).filter(tool => actor.ceiling.includes(tool))
     return {
       owner, bindingId: actor.id, parentBindingId, layer: actor.layer, model: {...model}, workspace: {...actor.target},
-      ...(actor.layer === 'L1' && owner === 'web:owner' && {workspaceVisible: true}),
+      ...(owner === 'web:owner' && {
+        workspaceTitle: actor.layer === 'L1' ? '棱镜' : '棱镜 ' + actor.layer + ('title' in actor ? ' · ' + actor.title : ''),
+      }),
       allowedTools: actor.layer === 'L3' ? currentCeiling : [],
       ...(actor.layer === 'L2' && {delegationCeiling: currentCeiling}),
       systemPrompt: systemPrompt(actor.layer, model),

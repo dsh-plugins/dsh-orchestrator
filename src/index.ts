@@ -38,6 +38,7 @@ export async function apply(ctx: Context, config: Config) {
   const mesh = ctx.get('dshMesh', true) as MeshService
   const directory = config.stateDirectory ?? dshPath('data', 'prism')
   const local = new DshSessionRunner(ctx, directory, ctx.prismRegistry)
+  ctx.on('agent/created', ({agent}) => local.guardHistoryAgent(agent), { prepend: true })
   for (const id of [mesh.nodeId, ...mesh.nodeIds]) {
     const provider = new PrismProvider(id, id === mesh.nodeId ? local : mesh.runnerFor(id))
     ctx.subagents.registerProvider(provider)
@@ -61,7 +62,7 @@ export async function apply(ctx: Context, config: Config) {
   try {
     for (const spec of core.localWorkspaceSessions(mesh.nodeId)) {
       try {
-        await local.restoreOwnerSession(spec)
+        await local.restoreWorkspaceHistory(spec)
       } catch (error) {
         ctx.logger.warn('无法恢复棱镜工作区会话 %s', spec.bindingId)
         ctx.logger.warn(error)

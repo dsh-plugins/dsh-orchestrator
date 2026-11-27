@@ -21,6 +21,7 @@ export class SessionBindings {
         binding TEXT PRIMARY KEY, scope TEXT NOT NULL, session TEXT NOT NULL UNIQUE
       );
       CREATE TABLE IF NOT EXISTS pending_archive (binding TEXT NOT NULL, session TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS legacy_histories (binding TEXT PRIMARY KEY, session TEXT NOT NULL UNIQUE);
     `)
   }
 
@@ -34,6 +35,39 @@ export class SessionBindings {
     if (!row) return undefined
     if (row.scope !== this.scope(spec)) throw new Error('Session binding belongs to a different scope')
     return SessionId(String(row.session))
+  }
+
+  isWebRoot(session: SessionId): boolean {
+    const row = this.db.prepare('SELECT scope FROM bindings WHERE session = ?').get(session)
+    if (!row) {
+      return false
+    }
+    const [owner, layer] = JSON.parse(String(row.scope)) as string[]
+    return owner === 'web:owner' && layer === 'L1'
+  }
+
+  legacyHistory(binding: string): SessionId | undefined {
+    const row = this.db.prepare('SELECT session FROM legacy_histories WHERE binding = ?').get(binding)
+    return row ? SessionId(String(row.session)) : undefined
+  }
+
+  isLegacyHistory(session: SessionId): boolean {
+    return this.db.prepare('SELECT 1 FROM legacy_histories WHERE session = ?').get(session) !== undefined
+  }
+
+  convertVisibleRoot(spec: TurnSpec, original: SessionId, next: SessionId): void {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      if (this.current(spec) !== original) {
+        throw new Error('原交互会话绑定已变更')
+      }
+      this.db.prepare('UPDATE bindings SET session = ? WHERE binding = ?').run(next, spec.bindingId)
+      this.db.prepare('INSERT INTO legacy_histories VALUES (?, ?)').run(spec.bindingId, original)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   parent(spec: TurnSpec): SessionId | undefined {

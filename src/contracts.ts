@@ -65,8 +65,8 @@ export interface TurnSpec {
   owner: string
   parentBindingId?: string
   layer: Layer
-  /** 仅本机 Web 所有者的交互会话可在 DSH 工作区作为普通会话访问。 */
-  workspaceVisible?: boolean
+  /** 本机网页所有者的原生工作区会话标题。此字段不经过 Mesh。 */
+  workspaceTitle?: string
   model: ModelConfig
   workspace: WorkspaceTarget
   /** Native DSH tools only; orchestration capabilities are supplied separately. */

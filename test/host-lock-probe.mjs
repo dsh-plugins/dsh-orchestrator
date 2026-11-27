@@ -1,17 +1,21 @@
 import assert from 'node:assert/strict'
+import { mkdir, realpath } from 'node:fs/promises'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { buildForkSeed, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import { DshSessionRunner } from '../dist/host.js'
+import { SessionBindings } from '../dist/host-bindings.js'
+import { isWorkspaceHistory } from '../dist/workspace-history.js'
 
 export const name = 'prism-lock-probe'
 export const inject = ['agents', 'sessions', 'agentLoop', 'agentPresets', 'sessionPersistence',
-  'sessionQuery', 'sessionTitle', 'systemPrompt', 'tools', 'llm', 'workspaceRegistry', 'webServer']
+  'sessionQuery', 'sessionTitle', 'systemPrompt', 'tools', 'llm', 'workspaceRegistry', 'webServer', 'sessionController']
 
 export function apply(ctx, config) {
   // A preset declaration and service mount can finish in different Cordis fibers.
   void (async () => {
     const host = new DshSessionRunner(ctx, config.directory)
+    const stopGuard = ctx.on('agent/created', ({agent}) => host.guardHistoryAgent(agent), { prepend: true })
     try {
       while (!(await ctx.agentPresets.list()).some(preset => preset.id === 'prism-l3')) {
         await new Promise(resolve => setTimeout(resolve, 25))
@@ -90,21 +94,25 @@ export function apply(ctx, config) {
       const oldSpec = session('old-owner')
       const oldId = await run(oldSpec, '原始会话内容')
       assert.equal((await ctx.sessionPersistence.stat(oldId)).header.origin, 'subagent')
-      const visibleSpec = { ...oldSpec, workspaceVisible: true }
-      await host.restoreOwnerSession(visibleSpec)
-      const restored = workspace.getSessionHeaders().find(header => header.origin === undefined)
+      const visibleSpec = { ...oldSpec, workspaceTitle: '棱镜' }
+      await host.restoreWorkspaceHistory(visibleSpec)
+      const restored = workspace.getSessionHeaders().find(header => isWorkspaceHistory(header.id))
       assert.ok(restored)
       assert.notEqual(restored.id, oldId)
+      assert.equal(restored.origin, undefined)
       assert.ok(!ctx.workspaceRegistry.archivedSessionIds.includes(oldId))
       assert.equal((await ctx.sessionQuery.readTitle(restored.id)).title, '棱镜')
       assert.ok((await host.transcript(visibleSpec)).some(entry => entry.text.includes('原始会话内容')))
-      await host.restoreOwnerSession(visibleSpec)
-      assert.equal(await run(visibleSpec, '继续原来的会话'), restored.id)
+      await host.restoreWorkspaceHistory(visibleSpec)
+      assert.equal(await run(visibleSpec, '继续原来的会话'), oldId)
+      assert.equal(workspace.sessionIds.filter(isWorkspaceHistory).length, 1)
+      assert.ok((await ctx.sessionQuery.readSession(restored.id)).events.some(
+        event => event.type === 'user/message' && JSON.stringify(event.data).includes('继续原来的会话')))
+      assert.equal((await ctx.sessionPersistence.stat(restored.id)).header.isSeeded, false)
+      await assert.rejects(ctx.agents.resume({resumeSessionId: restored.id}), {name: 'SessionAlreadyOwnedError'})
 
-      const freshId = await run({ ...session('new-owner'), workspaceVisible: true }, '首次交互')
-      assert.ok(workspace.sessionIds.includes(freshId))
-      assert.equal((await ctx.sessionPersistence.stat(freshId)).header.origin, undefined)
-      assert.equal((await ctx.sessionQuery.readTitle(freshId)).title, '棱镜')
+      const freshSpec = session('new-owner')
+      const freshId = await run(freshSpec, '首次交互')
 
       const planner = { ...session('planner'), layer: 'L2', parentBindingId: 'new-owner' }
       const plannerId = await run(planner, '已取得执行步骤的结果')
@@ -113,7 +121,7 @@ export function apply(ctx, config) {
       const lock = await ctx.sessionPersistence.open(freshId, 'write')
       let replacement
       try {
-        replacement = await run({ ...session('new-owner'), workspaceVisible: true }, '继续与棱镜对话')
+        replacement = await run(freshSpec, '继续与棱镜对话')
         assert.notEqual(replacement, freshId)
         assert.ok(!ctx.workspaceRegistry.archivedSessionIds.includes(freshId))
       } finally {
@@ -121,7 +129,7 @@ export function apply(ctx, config) {
       }
       using bindings = new DatabaseSync(join(config.directory, 'sessions.sqlite'))
       bindings.prepare('INSERT INTO pending_archive VALUES (?, ?)').run('new-owner', freshId)
-      assert.equal(await run({ ...session('new-owner'), workspaceVisible: true }, '继续交互'), replacement)
+      assert.equal(await run(freshSpec, '继续交互'), replacement)
       assert.ok(!ctx.workspaceRegistry.archivedSessionIds.includes(freshId))
       assert.equal(await run(planner, '旧父会话仍存在，继续整理结果'), plannerId)
       await ctx.workspaceRegistry.archiveSession(freshId, { stopActivity: true })
@@ -143,12 +151,83 @@ export function apply(ctx, config) {
         await activeLease.close()
       }
 
-      const imId = await run({ ...session('private-im'), owner: 'im:fixture', workspaceVisible: true }, '私聊内容')
+      const ordinarySpec = { ...session('old-ordinary'), workspaceTitle: '棱镜' }
+      const ordinaryId = SessionId('session-prism-ordinary-fixture')
+      const {events: originalEvents} = await ctx.sessionQuery.readSession(oldId)
+      const endSeq = SessionLogOffset(originalEvents.length)
+      const ordinary = await ctx.agents.create({
+        sessionId: ordinaryId,
+        seed: buildForkSeed(originalEvents, originalEvents.at(-1).seq),
+        inheritedEventCount: endSeq,
+        parentSource: {sessionId: oldId, endSeq},
+        meta: {cwd: config.directory, agentPreset: 'prism-l1', isSeeded: true},
+      })
+      const legacyBindings = new SessionBindings(config.directory)
+      try {
+        assert.ok(legacyBindings.publish(ordinarySpec, undefined, ordinaryId))
+        await ctx.sessions.flush(ordinary.agent.session)
+      } finally {
+        legacyBindings.close()
+        await ordinary.dispose()
+      }
+      await host.restoreWorkspaceHistory(ordinarySpec)
+      await assert.rejects(ctx.agents.resume({resumeSessionId: ordinaryId}), {name: 'SessionAlreadyOwnedError'})
+      const privateRoot = await run(ordinarySpec, '旧原生会话继续运行')
+      assert.notEqual(privateRoot, ordinaryId)
+      assert.equal((await ctx.sessionPersistence.stat(privateRoot)).header.origin, 'subagent')
+      assert.ok(!ctx.workspaceRegistry.archivedSessionIds.includes(ordinaryId))
+      assert.ok(!(await ctx.sessionQuery.readSession(privateRoot)).events.some(
+        event => event.type === 'session/end-seed' && event.data.inherited === true))
+      assert.ok((await ctx.sessionQuery.readSession(ordinaryId)).events.some(
+        event => event.type === 'user/message' && JSON.stringify(event.data).includes('旧原生会话继续运行')))
+      assert.equal(await run(ordinarySpec, '旧原生会话再次继续'), privateRoot)
+
+      const childDirectory = join(config.directory, 'child')
+      await mkdir(childDirectory)
+      const cwd = await realpath(childDirectory)
+      const childSpec = (layer, parentBindingId) => ({
+        ...session('child-' + layer), layer, parentBindingId,
+        workspace: { projectId: 'child', nodeId: 'local', cwd },
+        workspaceTitle: '棱镜 ' + layer,
+      })
+      const l2 = childSpec('L2', oldSpec.bindingId)
+      const l3 = childSpec('L3', l2.bindingId)
+      const l2Id = await run(l2, '规划记录')
+      const l3Id = await run(l3, '执行记录')
+      assert.equal((await ctx.sessionPersistence.stat(l2Id)).header.origin, 'subagent')
+      assert.equal((await ctx.sessionPersistence.stat(l3Id)).header.parentSession, l2Id)
+      const childWorkspace = ctx.workspaceRegistry.list().find(workspace => workspace.path === cwd)
+      assert.ok(childWorkspace)
+      const mirrors = childWorkspace.sessionIds.filter(isWorkspaceHistory)
+      assert.equal(mirrors.length, 2)
+      const titles = await Promise.all(mirrors.map(async id => (await ctx.sessionQuery.readTitle(id)).title))
+      assert.deepEqual(titles.sort(), ['棱镜 L2', '棱镜 L3'])
+      const signal = new AbortController().signal
+      const listing = await ctx.sessionController.list({}, signal)
+      for (const id of mirrors) {
+        const summary = listing.items.find(item => item.sessionId === id)
+        assert.ok(summary && summary.origin === undefined && !summary.blank)
+        const stream = ctx.sessionController.follow({address: {kind: 'session', sessionId: id}, activate: true}, signal)[Symbol.asyncIterator]()
+        try {
+          const opening = await stream.next()
+          assert.equal(opening.value.type, 'snapshot')
+          assert.equal(opening.value.header.id, id)
+        } finally {
+          await stream.return()
+        }
+        assert.equal(ctx.agents.get(id), undefined)
+      }
+      const imId = await run({ ...session('private-im'), owner: 'im:fixture', workspaceTitle: '棱镜' }, '私聊内容')
       assert.equal((await ctx.sessionPersistence.stat(imId)).header.origin, 'subagent')
+      assert.equal(workspace.sessionIds.filter(isWorkspaceHistory).length, 1)
+      await host.close()
+      const released = await ctx.sessionPersistence.open(restored.id, 'write')
+      await released.close()
       process.stdout.write('PRISM_LOCK_OK\n')
     } catch (error) {
       process.stdout.write('PRISM_LOCK_ERROR ' + (error instanceof Error ? error.stack : String(error)) + '\n')
     } finally {
+      stopGuard()
       await host.close()
     }
   })()
