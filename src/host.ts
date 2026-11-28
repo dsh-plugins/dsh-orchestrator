@@ -157,9 +157,9 @@ export class DshSessionRunner implements SessionRunner {
                 if (!project.permissions.includes(exec.name)) {
                   return 'Project tool permission was revoked'
                 }
-                if (project.workspaceId !== undefined) {
+                if (project.workspaceId !== undefined && ['read', 'read_image', 'glob', 'grep'].includes(exec.name)) {
                   const args = exec.arguments as { file_path?: unknown; path?: unknown } | null
-                  const target = exec.name === 'read' ? args?.file_path : (args?.path ?? '.')
+                  const target = exec.name === 'read' || exec.name === 'read_image' ? args?.file_path : (args?.path ?? '.')
                   if (typeof target !== 'string' || !withinWorkspace(project.workspace, target)) {
                     return 'The requested path is outside the registered DSH workspace'
                   }
